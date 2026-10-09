@@ -1,0 +1,40 @@
+# wild-work Docker Compose
+#
+# 首次使用：
+#   1. echo "WILDWORK_ADMIN_PASSWORD=请换成你的口令" > .env   # 非环回监听强制要求（R4）
+#   2. docker compose up -d --build
+#   3. 浏览器打开 http://127.0.0.1:7863/ → 面板登录 → 管理账号
+#
+# 容器内添加账号的限制见 README「Docker」小节：浏览器/CDP 登录不可用，
+# 建议在桌面版加好账号后把 auths/ 拷进 ./wildwork-data/，或用 glm 手工 token。
+services:
+  wild-work:
+    build:
+      context: .
+      args:
+        # 模块代理：默认官方源；大陆网络一条命令覆盖（不改文件）：
+        #   GOPROXY=https://goproxy.cn,direct docker compose up -d --build
+        GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}"
+    image: wild-work:local
+    container_name: wild-work
+    restart: unless-stopped
+    ports:
+      # 宿主机端口冲突时改左侧，如 "8080:7863"（容器内监听端口不变则健康检查无需动）
+      - "7863:7863"
+    environment:
+      TZ: Asia/Shanghai # 镜像已默认；签到时刻按此时区计算
+      # 容器内必须对外监听：127.0.0.1 指向容器自己，端口映射会不可达。
+      # 一旦对外监听，管理密码即为强制（启动层双重把关，见 R4）。
+      WILDWORK_LISTEN: "0.0.0.0:7863"
+      # ${VAR:?提示} 形式：未设置时 compose 直接报错，不会起一个起不来的容器
+      WILDWORK_ADMIN_PASSWORD: "${WILDWORK_ADMIN_PASSWORD:?未设置管理密码——请先 echo 'WILDWORK_ADMIN_PASSWORD=你的口令' > .env}"
+      # OpenAI 接口 Key。默认值是公开的 WildWorkAPI，端口暴露到局域网/公网前务必覆盖：
+      # .env 里加 WILDWORK_API_KEY=sk-你的key
+      WILDWORK_API_KEY: "${WILDWORK_API_KEY:-WildWorkAPI}"
+    volumes:
+      # 数据根（WILDWORK_HOME）：./wildwork-data/{config.json, auths/, data/}，
+      # 与便携版安装目录布局一致，可整体拷贝迁移。
+      # 首次创建的目录属主为 root，镜像以 uid 1000 运行——Linux 主机请先：
+      #   mkdir -p wildwork-data && sudo chown 1000:1000 wildwork-data
+      # （Docker Desktop / macOS / Windows 自动映射，无需处理）
+      - ./wildwork-data:/data

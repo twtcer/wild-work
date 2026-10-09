@@ -9,6 +9,10 @@ auths/
 config.json
 *.log
 
+# Docker 本地形态（compose 挂载点 ./wildwork-data 含账号凭据；.env 含管理密码）
+wildwork-data/
+.env
+
 # 参考项目（第三方克隆，不纳入版本控制）
 ref/
 

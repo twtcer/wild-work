@@ -1,0 +1,37 @@
+# 构建上下文只留源码与 embed 资源。
+# ⚠️ 模式均只匹配根级路径：cmd/wild-work/build/trayicon.ico 与
+#    cmd/wild-work/web/ 是 go:embed 资源，绝不排除（误伤会导致容器内 go build 失败）。
+
+# 版本控制 / CI / 文档（构建不需要）
+.git/
+.github/
+docs/
+ref/
+scripts/
+AGENTS.md
+DEVELOPMENT.md
+README.md
+RELEASE-*.md
+
+# 运行时数据与敏感凭据：绝不进镜像/构建上下文
+data/
+auths/
+config.json
+*.log
+.env
+
+# 构建产物与非构建资产（根 build/ 是 rsrc/macos 打包脚本用的，go build 不需要；
+# 根 icon.png 仅 cmd/genicon 用，本镜像只编 ./cmd/wild-work）
+dist/
+build/
+*.syso
+icon.png
+wechat_group.jpg
+
+# Docker 自身
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 本地数据目录（compose 挂载点，含凭据）
+wildwork-data/

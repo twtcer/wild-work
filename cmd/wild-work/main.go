@@ -94,6 +94,16 @@ func main() {
 			if err := config.Save(cfg, cfgPath); err != nil {
 				log.Printf("write default config: %v", err)
 			}
+			// 首启必须重读走完整 Load（applyEnv + normalize），否则：
+			// ① WILDWORK_* 环境变量在首启不生效——容器场景（Docker）没有
+			//    WILDWORK_LISTEN/WILDWORK_ADMIN_PASSWORD 就会监听 127.0.0.1
+			//    且缺管理密码，端口映射不可达、要重启一次才正常；
+			// ② 时长字段（硬/软冷却、临期阈值）未经 normalize 全是零值，
+			//    与二次启动（走完整 Load）的行为不一致。
+			// 读回失败（如目录只读没写成 config.json）沿用内存默认值，保持旧行为不致命。
+			if cfg2, lerr := config.Load(cfgPath); lerr == nil {
+				cfg = cfg2
+			}
 		} else {
 			fatal("加载配置失败：%v\n\n请检查 config.json 后重新启动", err)
 		}

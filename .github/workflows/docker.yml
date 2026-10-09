@@ -1,0 +1,56 @@
+name: Docker Image
+
+# 发版 tag（v*）构建 linux/amd64 + arm64 镜像推 GHCR；也可手动触发（dev 标签）。
+# 与 build.yml（五平台二进制 release）相互独立：本工作流失败不阻塞二进制发版。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 的运行阶段（apk add）在 QEMU 模拟下执行；构建阶段由 Dockerfile 的
+      # --platform=$BUILDPLATFORM + GOARCH 交叉编译，不吃模拟开销。
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR 要求镜像名全小写（仓库 owner 可能含大写），bash 4 的 ,,, 一刀搞定
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            # tag 触发 → v1.2.3 / 1.2 / latest（semver 类型只在 tag ref 上生效）
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # 手动触发（非 tag）→ dev；tag 触发 → latest
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=dev,enable=${{ github.ref_type != 'tag' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

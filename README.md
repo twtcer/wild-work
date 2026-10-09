@@ -86,6 +86,59 @@
 
 启动后打印 API 地址、Key 等信息，阻塞运行，Ctrl+C 退出。
 
+### Docker（服务器 / NAS / 群晖）
+
+```bash
+# 1. 设置面板管理密码（容器对外监听时强制要求，见「面板登录」小节）
+echo "WILDWORK_ADMIN_PASSWORD=请换成你的口令" > .env
+
+# 2. 构建并启动（首次会下载基础镜像并在容器内编译，主机无需 Go 工具链）
+docker compose up -d --build
+
+# 3. 打开面板
+# http://127.0.0.1:7863/
+```
+
+等价的 `docker run`：
+
+```bash
+docker build -t wild-work .
+# Linux 主机先让挂载目录对镜像用户（uid 1000）可写：
+mkdir -p wildwork-data && sudo chown 1000:1000 wildwork-data   # Docker Desktop 可跳过
+docker run -d --name wild-work --restart unless-stopped \
+  -p 7863:7863 \
+  -e WILDWORK_LISTEN=0.0.0.0:7863 \
+  -e WILDWORK_ADMIN_PASSWORD='请换成你的口令' \
+  -v "$PWD/wildwork-data:/data" \
+  wild-work
+```
+
+行为约定：
+
+- **数据落点**：全部在 `./wildwork-data/`，目录布局与便携版安装目录 1:1 一致
+  （`config.json` + `auths/` + `data/`）——已有安装可整体拷入直接迁移
+- **时区**：镜像默认 `TZ=Asia/Shanghai`（签到时刻按此时区计算，容器默认 UTC 会晚 8 小时）
+- **运行身份**：非 root（uid 1000）；健康检查打 `/healthz`（若改了容器内监听端口需同步覆盖）
+- **环境变量优先于 config.json**（`WILDWORK_LISTEN` / `WILDWORK_ADMIN_PASSWORD` /
+  `WILDWORK_API_KEY` / `WILDWORK_AUTH_DIR` 等，完整清单见 `internal/config.applyEnv`）
+- **大陆网络**：官方 Go 模块代理不可达时加 `GOPROXY` 前缀构建——
+  `GOPROXY=https://goproxy.cn,direct docker compose up -d --build`
+  （纯 `docker build` 则加 `--build-arg GOPROXY=https://goproxy.cn,direct`）
+- 覆盖 CMD 传其它参数时必须自带 `--no-tray`（容器内无托盘）
+
+⚠️ **容器内添加账号的限制**：
+
+- 浏览器登录（WorkBuddy / TraeWork / Qoder / 千问办公）的 OAuth 回调打的是**容器内**
+  `127.0.0.1:<随机端口>`，宿主机浏览器够不着 → 推荐在桌面版加好账号后，
+  把桌面版的 `auths/` 目录拷进 `./wildwork-data/auths/` 再重启容器
+- 智谱清言 CDP 自动登录需要真实浏览器，容器内不可用；可改用面板「手工粘贴
+  refresh_token」路径
+- 导入型渠道（MonkeyCode / 小浣熊 / Loomy）读本机客户端文件，容器内需自行挂载对应目录
+- OpenCodeZen 匿名通道不受影响，开箱即用
+
+镜像发布：push `v*` tag 自动构建 linux/amd64 + arm64 镜像到 GHCR
+（`ghcr.io/<owner>/wild-work`）。
+
 ## 配置 AI 客户端
 
 ### 1. 获取模型列表
