@@ -224,13 +224,24 @@ func TestQueryCrossMonthSegments(t *testing.T) {
 	}
 }
 
-// monthEdgeTs 构造「本月 1~6 号」的时间戳——7 天窗口跨月、from 落在上月末尾的场景，
-// 正是旧枚举 bug 的触发窗口（当前不在月初时取本月 2 号保证落在 7 天窗口内）。
+// monthEdgeTs 返回「Query(7) 窗口内 ∩ 当月」的时间戳——跨月枚举 bug 的触发
+// 场景（7 天窗口跨月时当月分段必须被扫到），任何日期都满足两条性质：
+// ① ≥ 窗口起点（今天零点往前 6 天，即 fromTs 口径）；② 属于当月。
+//
+// 旧实现取「本月 2 号 00:00」，只在当月 1–8 号落于窗口内：9 号起窗口起点
+// 已晚于 2 号，条目被 e.Ts < fromTs 过滤 → 测试只在每月上旬通过
+// （2026-10-09 实锤：测试写于 10-08，当时以为 2 号恒在 7 天窗口内）。
 func monthEdgeTs(t *testing.T) int64 {
 	t.Helper()
 	now := time.Now()
-	ts := time.Date(now.Year(), now.Month(), 2, 0, 0, 0, 0, now.Location())
-	if ts.After(now) { // 本月 2 号还没到（今天是 1 号）：直接用当前时间
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	windowStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -6)
+	ts := windowStart
+	if ts.Before(monthStart) {
+		// 窗口起点还在上月（1–6 号）：取当月 1 号 00:00，恰在窗口内且属当月
+		ts = monthStart
+	}
+	if ts.After(now) {
 		ts = now
 	}
 	return ts.Unix()

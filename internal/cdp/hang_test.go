@@ -78,8 +78,11 @@ func TestWriteDoesNotHangClose(t *testing.T) {
 	select {
 	case <-done:
 		t.Log("✅ 写操作在对端不读时正常返回（有超时保护）")
-	case <-time.After(12 * time.Second):
-		t.Fatal("❌ 写操作挂死超过 12s：对端不读时无超时保护")
+	case <-time.After(ws.writeTimeout + 5*time.Second):
+		// 阈值必须 **大于** 实现里的 writeTimeout（当前硬编码 15s），否则当 TCP
+		// 缓冲真的被填满（Linux 必触发；macOS loopback 缓冲大则碰巧不触发）时
+		// 必然误报——旧阈值 12s < 15s，测的是环境而非代码（2026-10-09 容器内实锤）。
+		t.Fatalf("❌ 写操作超过 writeTimeout(%s)+5s 未返回：写超时保护失效", ws.writeTimeout)
 	}
 
 	// Close 也必须在有限时间内返回

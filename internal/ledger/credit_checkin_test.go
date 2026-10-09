@@ -11,6 +11,7 @@ package ledger
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"wild-work/internal/provider"
 )
@@ -29,9 +30,14 @@ func newTestLedger(t *testing.T) *Ledger {
 // grantAndConsumeItem 造一个「发放即消耗」的条目：remain 与上次持平、used 上涨
 // （WorkBuddy 签到包的真实形态：昨日快照 r=0/u=0 → 今日签到发放 100 并被用掉 100）。
 func grantAndConsumeItem(remain, used int64) []provider.ResourceItem {
+	// 到期日必须动态取未来日期：写死具体日期时测试只在该日期**之前**通过——
+	// 到期日（≤今天，UTC+8）当天起，「remain 下降」会被差分判成 expire 而非
+	// spend（credit.go expired()），断言 spend=100 必然失败（2026-10-09 踩中：
+	// 测试写于 10-08，硬编码的 ExpireAt 恰好是次日）。
+	expire := time.Now().AddDate(0, 0, 7).Format("2006-01-02")
 	return []provider.ResourceItem{
 		{Name: "CodeBuddy个人版国内运营裂变包", Total: remain + used, Used: used, Remain: remain,
-			ExpireAt: "2026-10-09", Key: "CodeBuddy个人版国内运营裂变包|2026-10-09", Usable: true},
+			ExpireAt: expire, Key: "CodeBuddy个人版国内运营裂变包|" + expire, Usable: true},
 	}
 }
 
