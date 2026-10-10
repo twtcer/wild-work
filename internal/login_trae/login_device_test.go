@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	"wild-work/internal/logincb"
 	"wild-work/internal/traework"
 )
 
@@ -44,7 +45,7 @@ func TestStartGeneratesFreshDevicePerSession(t *testing.T) {
 
 	var dev1, mach1, dev2, mach2 string
 	for i := 0; i < 2; i++ {
-		authURL, err := Start(NewClient(), statePath)
+		authURL, err := Start(NewClient(), statePath, logincb.Options{})
 		if err != nil {
 			t.Fatalf("Start #%d: %v", i+1, err)
 		}
@@ -89,7 +90,7 @@ func TestPollSavesDeviceIntoAuthFileAndCleansLegacy(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	authURL, err := Start(NewClient(), statePath)
+	authURL, err := Start(NewClient(), statePath, logincb.Options{})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

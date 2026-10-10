@@ -89,8 +89,13 @@
 ### Docker（服务器 / NAS / 群晖）
 
 ```bash
-# 1. 设置面板管理密码（容器对外监听时强制要求，见「面板登录」小节）
-echo "WILDWORK_ADMIN_PASSWORD=请换成你的口令" > .env
+# 1. 生成 .env —— 已带全套桌面形态默认参数，逐项说明见 .env.example
+#    （容器对外监听时必须改掉 WILDWORK_ADMIN_PASSWORD，见「面板登录」小节）
+cp .env.example .env
+sed -i.bak 's/请换成你的口令/你的口令/' .env && rm -f .env.bak   # Linux/macOS；Windows 手动编辑
+
+# （可选）其余默认参数（接口 Key / 冷却 / 超时 / 默认渠道等）都直接在 .env 里改，
+#        改完 docker compose up -d 重启即生效，无需进容器、不碰 config.json
 
 # 2. 构建并启动（首次会下载基础镜像并在容器内编译，主机无需 Go 工具链）
 docker compose up -d --build
@@ -107,8 +112,10 @@ docker build -t wild-work .
 mkdir -p wildwork-data && sudo chown 1000:1000 wildwork-data   # Docker Desktop 可跳过
 docker run -d --name wild-work --restart unless-stopped \
   -p 7863:7863 \
+  -p 127.0.0.1:43903:43903 \
   -e WILDWORK_LISTEN=0.0.0.0:7863 \
   -e WILDWORK_ADMIN_PASSWORD='请换成你的口令' \
+  -e WILDWORK_API_KEY='sk-8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a' \
   -v "$PWD/wildwork-data:/data" \
   wild-work
 ```
@@ -119,8 +126,21 @@ docker run -d --name wild-work --restart unless-stopped \
   （`config.json` + `auths/` + `data/`）——已有安装可整体拷入直接迁移
 - **时区**：镜像默认 `TZ=Asia/Shanghai`（签到时刻按此时区计算，容器默认 UTC 会晚 8 小时）
 - **运行身份**：非 root（uid 1000）；健康检查打 `/healthz`（若改了容器内监听端口需同步覆盖）
-- **环境变量优先于 config.json**（`WILDWORK_LISTEN` / `WILDWORK_ADMIN_PASSWORD` /
-  `WILDWORK_API_KEY` / `WILDWORK_AUTH_DIR` 等，完整清单见 `internal/config.applyEnv`）
+- **外部配置（`.env`）**：compose 把桌面形态的默认参数全部透传进容器——
+  `WILDWORK_API_KEY` / `AUTH_DIR` / `STATE_FILE` / `REGION` / `HARD_CREDIT` / `SOFT_RATE` /
+  `ERR_THRESHOLD` / `ERR_COOLDOWN` / `TIMEOUT_SECONDS` / `CALLBACK_HOST` / `DEFAULT_CHANNEL` /
+  `MAX_TOKENS_CAP`（清单与默认值见 `.env.example`，默认值同 `internal/config.Default()`）。
+  优先级：**`.env` > `wildwork-data/config.json` > 代码默认**（完整 env 清单见 `internal/config.applyEnv`）。
+  写法是 `${VAR:-}`：**`.env` 里不写某行就不注入该变量**，面板对同一项的修改照常生效；
+  写了则以 `.env` 为准（会盖掉面板改动，改配置请改 `.env`）
+- **容器固定项**：`TZ` / `WILDWORK_HOME` / `WILDWORK_LISTEN=0.0.0.0:7863` /
+  `WILDWORK_CALLBACK_LISTEN=0.0.0.0:43903` 定义在 `docker-compose.yml` / `Dockerfile`，
+  不走 `.env`（改动需同步 `ports` 与健康检查）
+- **接口 API Key**：唯一带兜底默认值的项，默认
+  `sk-8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a`，端口暴露到局域网/公网前请在 `.env` 改掉。
+  配置 AI 客户端时用这个 Key，别照抄下文通用小节里的 `WildWorkAPI`（那是桌面形态的默认值）
+- **没有环境变量的参数**（签到时刻 / 保活小时 / 临期阈值 / 模型映射表 / 单渠道代理）：
+  改面板或挂载的 `wildwork-data/config.json` 即可（挂载点在容器外，本身就是外部配置）
 - **大陆网络**：官方 Go 模块代理不可达时加 `GOPROXY` 前缀构建——
   `GOPROXY=https://goproxy.cn,direct docker compose up -d --build`
   （纯 `docker build` 则加 `--build-arg GOPROXY=https://goproxy.cn,direct`）
@@ -128,12 +148,21 @@ docker run -d --name wild-work --restart unless-stopped \
 
 ⚠️ **容器内添加账号的限制**：
 
-- 浏览器登录（WorkBuddy / TraeWork / Qoder / 千问办公）的 OAuth 回调打的是**容器内**
-  `127.0.0.1:<随机端口>`，宿主机浏览器够不着 → 推荐在桌面版加好账号后，
-  把桌面版的 `auths/` 目录拷进 `./wildwork-data/auths/` 再重启容器
+- **浏览器登录（TraeWork / 千问办公）**：这两个渠道的登录要在本机起一个 HTTP 回调收授权码，
+  redirect_uri 固定写 `http://127.0.0.1:43903/callback`（TraeWork 是 `/authorize`）。
+  容器内该端口绑在 `0.0.0.0:43903`，所以**必须把它发布到宿主**（compose 已配好
+  `127.0.0.1:43903:43903`）——否则浏览器拿到 code 后 connection refused，登录 5 分钟超时。
+  只用 `docker run` 时记得加 `-p 127.0.0.1:43903:43903`（镜像已默认
+  `WILDWORK_CALLBACK_LISTEN=0.0.0.0:43903`）。
+  **从另一台机器打开面板**时，`127.0.0.1` 指向的是那台机器，需要发布到所有网卡
+  （`-p 43903:43903`）并把 `WILDWORK_CALLBACK_HOST` 设为面板所在机器的 IP/域名
+  （该非环回 redirect_uri 上游是否接受未实测；同机使用无此问题）。
+  其余浏览器登录渠道（WorkBuddy 国内 / WorkBuddy 国际 / Qoder 系列）**不走本机回调**
+  （授权后由上游接口轮询结果），容器内可直接添加。
 - 智谱清言 CDP 自动登录需要真实浏览器，容器内不可用；可改用面板「手工粘贴
   refresh_token」路径
 - 导入型渠道（MonkeyCode / 小浣熊 / Loomy）读本机客户端文件，容器内需自行挂载对应目录
+  （小浣熊的「浏览器授权」走系统协议回调，容器内不可用，只能用导入路径）
 - OpenCodeZen 匿名通道不受影响，开箱即用
 
 镜像发布：push `v*` tag 自动构建 linux/amd64 + arm64 镜像到 GHCR
@@ -473,12 +502,6 @@ TraeWork 的额度分两个池，由上游 `available_endpoint` 字段区分：
 3. 使用者应**自行承担**因使用本工具产生的一切风险与后果；若不同意上述条款，请立即停止使用并删除本软件。
 4. 本工具与上游各平台及其运营方**无任何关联与合作**；相关商标与品牌权利归其各自所有者所有。
 5. 如本工具的使用对上游平台造成影响或平台方提出异议，作者将配合处理；本项目的存在不代表对任何规避行为的价值判断。
-
-## 交流群
-
-微信扫码加入「野活儿老白蹬之家」，有问题欢迎在群里反馈：
-
-<img src="wechat_group.jpg" alt="野活儿老白蹬之家 微信群二维码" width="320">
 
 ## License
 

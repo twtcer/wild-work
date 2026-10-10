@@ -11,7 +11,7 @@
   "cooldown": {
     "hard_credit": "12h",
     "soft_rate": "60s",
-    "err_threshold": 5,
+    "err_threshold": 3,
     "err_cooldown": "10m"
   },
   "schedule": {
@@ -21,6 +21,10 @@
   },
   "upstream": {
     "timeout_seconds": 120
+  },
+  "callback": {
+    "listen": "127.0.0.1:0",
+    "host": "127.0.0.1"
   },
   "compat": {
     "default_channel": "workbuddy",

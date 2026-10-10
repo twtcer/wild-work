@@ -39,7 +39,7 @@ body {
 .brand-text .sub { font-size: 11px; color: var(--muted); }
 
 .top-info { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; flex: 1; max-width: 480px; }
-.info-cell { display: flex; align-items: center; gap: 8px; }
+.info-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .info-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
 .info-value {
   font-size: 12px; color: var(--muted); background: #f0f2f5; padding: 4px 10px;
@@ -48,6 +48,14 @@ body {
 }
 .info-value:hover { color: var(--primary); background: #e0e7ff; }
 .info-value .val { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; flex-shrink: 1; }
+/* 复制按钮：超长值截断后仍常驻可见；点击复制（与点击文本同一动作） */
+.info-value .copy-btn {
+  flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+  margin-left: 6px; padding: 1px; border-radius: 4px; color: var(--muted);
+  cursor: pointer; transition: color .15s, background .15s;
+}
+.info-value .copy-btn:hover, .info-value .copy-btn:focus-visible { color: var(--primary); background: #dbeafe; outline: none; }
+.info-value .copy-btn svg { display: block; }
 
 .top-icons { display: flex; gap: 8px; flex-shrink: 0; }
 .icon-link.gear { font-size: 18px; }

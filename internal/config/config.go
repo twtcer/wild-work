@@ -147,6 +147,17 @@ type Config struct {
 	// 空串或未列出的渠道直连。主要用途：给 oczen 等有区域限制的渠道走代理。
 	Proxies map[string]string `json:"proxies,omitempty"`
 
+	// Callback 本机 OAuth 回调监听（traework / qwenwork 两个渠道会起本地回调，
+	// 其余渠道均为上游轮询式、不经本地端口）。默认值即桌面旧行为；容器内需
+	// 固定端口并对宿主发布，否则浏览器拿 code 后 connection refused（登录超时）。
+	// 详见 internal/logincb 包注释。
+	Callback struct {
+		// Listen 监听地址（net.Listen 形式）：桌面 "127.0.0.1:0"、容器 "0.0.0.0:43903"。
+		Listen string `json:"listen,omitempty"`
+		// Host 写进 redirect_uri 的主机（不含端口），默认 "127.0.0.1"。
+		Host string `json:"host,omitempty"`
+	} `json:"callback"`
+
 	// OczenAPIKey OpenCodeZen 渠道自定义 API key（sk-...）；空 = 匿名凭证（public）。
 	// 自定义 key 有独立配额（不受匿名通道共享限流），且可调用付费模型（需账户余额）。
 	OczenAPIKey string `json:"oczen_api_key,omitempty"`
@@ -172,6 +183,9 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "60s"
 	c.Cooldown.ErrThresh = 3
 	c.Cooldown.ErrCooldown = "10m"
+	// 与 internal/logincb 的默认值一致（显式写出，好与 config.example.json 对齐）
+	c.Callback.Listen = "127.0.0.1:0"
+	c.Callback.Host = "127.0.0.1"
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.CheckinTimes = []string{"09:00", "21:00"}
 	c.Schedule.KeepaliveHours = []int{22}
@@ -310,6 +324,12 @@ func applyEnv(c *Config) {
 			c.Upstream.TimeoutSeconds = n
 		}
 	}
+	if v := os.Getenv("WILDWORK_CALLBACK_LISTEN"); v != "" {
+		c.Callback.Listen = v
+	}
+	if v := os.Getenv("WILDWORK_CALLBACK_HOST"); v != "" {
+		c.Callback.Host = v
+	}
 	if v := os.Getenv("WILDWORK_DEFAULT_CHANNEL"); v != "" {
 		c.Compat.DefaultChannel = v
 	}
@@ -352,6 +372,24 @@ func (c *Config) normalize() error {
 		c.Listen.Port = 7863
 	}
 	c.AdminPass = strings.TrimSpace(c.AdminPass)
+	// 本机 OAuth 回调：启动时就校验，免得拼写错误只在用户登录那一步才暴露。
+	// （端口 0 = 随机，合法，故不复用 ParseListen——它要求 port>0）。
+	if s := strings.TrimSpace(c.Callback.Listen); s != "" {
+		if _, _, err := net.SplitHostPort(s); err != nil {
+			return fmt.Errorf("callback.listen 须为 host:port 形式（如 127.0.0.1:0 / 0.0.0.0:43903）: %q", s)
+		}
+		c.Callback.Listen = s
+	}
+	if s := strings.TrimSpace(c.Callback.Host); s != "" {
+		// redirect_uri 的主机不得混入端口/路径，否则 JoinHostPort 会拼出「host:port:port」。
+		if strings.ContainsAny(s, "/?# \t") {
+			return fmt.Errorf("callback.host 须为纯主机（不含端口/路径）: %q", s)
+		}
+		if net.ParseIP(s) == nil && strings.Contains(s, ":") {
+			return fmt.Errorf("callback.host 不要带端口（端口由 callback.listen 决定）: %q", s)
+		}
+		c.Callback.Host = s
+	}
 	// 代理配置清洗：剔除空值，校验 URL 形态（http/https/socks5）。
 	for k, v := range c.Proxies {
 		v = strings.TrimSpace(v)

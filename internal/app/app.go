@@ -31,6 +31,7 @@ import (
 	loginraccoon "wild-work/internal/login_raccoon"
 	logintrae "wild-work/internal/login_trae"
 	"wild-work/internal/login_wbai"
+	"wild-work/internal/logincb"
 	"wild-work/internal/oczen"
 	"wild-work/internal/platform"
 	"wild-work/internal/pool"
@@ -539,9 +540,13 @@ func (a *App) StartLoginFor(kind string) (string, error) {
 
 	var authURL string
 	var err error
+	// 本机回调监听（仅 traework / qwenwork 有）：容器内由
+	// WILDWORK_CALLBACK_LISTEN=0.0.0.0:43903 + compose 发布端口，否则浏览器
+	// 拿到 code 后 connection refused（见 internal/logincb）。
+	cbOpts := logincb.Options{Listen: a.cfg.Callback.Listen, Host: a.cfg.Callback.Host}
 	switch k {
 	case provider.TraeWork:
-		authURL, err = logintrae.Start(a.loginClient, a.loginStateFP)
+		authURL, err = logintrae.Start(a.loginClient, a.loginStateFP, cbOpts)
 	case provider.Qoder:
 		authURL, err = loginqoder.Start(a.loginClient, a.loginStateFP)
 	case provider.QoderCN:
@@ -551,7 +556,7 @@ func (a *App) StartLoginFor(kind string) (string, error) {
 	case provider.WorkBuddyAI:
 		authURL, err = loginwbai.Start(a.loginClient, a.loginStateFP)
 	case provider.QwenWork:
-		authURL, err = loginqwenwork.Start(a.loginClient, a.loginStateFP)
+		authURL, err = loginqwenwork.Start(a.loginClient, a.loginStateFP, cbOpts)
 	case provider.Raccoon:
 		// 协议回调接管要把「自身 exe 绝对路径」写进注册表命令行，故这里先取 os.Executable。
 		if exe, eerr := os.Executable(); eerr != nil {
@@ -589,9 +594,13 @@ func (a *App) CancelLogin() error {
 	}
 	cancel()
 	_ = os.Remove(a.loginStateFP)
-	// 千问办公登录附带本机回调 server，取消时一并关闭
+	// 本机回调 server：千问办公与 TraeWork 各有一个，取消时一并关掉
+	// （容器内是固定端口，不关会让下一次登录直接端口冲突）。
 	if kind == provider.QwenWork {
 		loginqwenwork.Shutdown()
+	}
+	if kind == provider.TraeWork {
+		logintrae.Shutdown()
 	}
 	// 小浣熊授权登录：取消时立刻恢复注册表（幂等；pollLogin 的 defer 还会再兜一次）
 	if kind == provider.Raccoon {
@@ -611,6 +620,14 @@ func (a *App) pollLogin(ctx context.Context) {
 		// 都必须把 office-raccoon 注册表恢复原状（Shutdown 幂等）。
 		if a.loginKind == provider.Raccoon {
 			loginraccoon.Shutdown(a.loginStateFP, a.stateDir())
+		}
+		// 本机回调监听（幂等，多半已自行关闭）：收尾时再关一次，
+		// 避免固定端口被挂住——见 internal/logincb。
+		if a.loginKind == provider.QwenWork {
+			loginqwenwork.Shutdown()
+		}
+		if a.loginKind == provider.TraeWork {
+			logintrae.Shutdown()
 		}
 		a.finishLogin()
 	}()

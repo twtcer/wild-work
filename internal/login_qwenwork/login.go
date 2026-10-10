@@ -32,6 +32,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"wild-work/internal/logincb"
 )
 
 // 上游常量（IDE 桌面版同款）。
@@ -78,6 +80,7 @@ var (
 	pending     = &pendingCode{}
 	callbackSrv *http.Server
 	callbackLn  net.Listener
+	cbMu        sync.Mutex // 保护 callbackSrv/callbackLn：Start 与 Shutdown 在不同 goroutine
 	srvOnce     sync.Once
 )
 
@@ -87,16 +90,23 @@ func NewClient() *http.Client {
 }
 
 // Start 发起登录：生成 PKCE、起本机回调、返回授权 URL。
-func Start(_ *http.Client, statePath string) (string, error) {
+//
+// cb 决定回调监听地址与 redirect_uri 中的主机：桌面零值即旧行为
+// （127.0.0.1:0 随机端口），容器内传 0.0.0.0:43903 并发布端口（见 logincb）。
+func Start(_ *http.Client, statePath string, cb logincb.Options) (string, error) {
 	verifier, challenge := makePKCE()
 
-	// 本机回调：随机空闲端口
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// 固定端口（容器）时上一次未关的回调会占着端口：先关一次（幂等）。
+	Shutdown()
+
+	// 本机回调：默认随机空闲端口；容器内为固定端口（宿主需发布同端口）
+	addr := cb.ListenAddr()
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return "", fmt.Errorf("listen callback: %w", err)
+		return "", fmt.Errorf("listen callback (%s): %w", addr, err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	redirectURI := cb.RedirectURL(port, "/callback")
 
 	authURL := fmt.Sprintf("%s/oauth2/auth?client_id=%s&code_challenge=%s&code_challenge_method=S256&redirect_uri=%s&response_type=code&scope=%s&state=%s",
 		OAuthBase, ClientID, challenge,
@@ -139,9 +149,14 @@ func Start(_ *http.Client, statePath string) (string, error) {
 		// 而非「登录成功」，避免兑换失败时误导；1.5s 自动关闭不变。
 		_, _ = io.WriteString(w, callbackPage(true, ""))
 	})
+	// 必须由闭包捕获 srv/ln：若在 goroutine 里读全局 callbackSrv，
+	// 另一条路径的 Shutdown()（置 nil）会让它 nil panic ——实测踩中过。
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	cbMu.Lock()
 	callbackLn = ln
-	callbackSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	go func() { _ = callbackSrv.Serve(ln) }()
+	callbackSrv = srv
+	cbMu.Unlock()
+	go func() { _ = srv.Serve(ln) }()
 	srvOnce = sync.Once{} // 允许下次登录重新 Start
 
 	return authURL, nil
@@ -221,13 +236,23 @@ func Poll(client *http.Client, statePath string) (Result, error) {
 	return res, nil
 }
 
-// Shutdown 关闭回调 server（登录结束/超时/取消时调用）。
+// Shutdown 关闭回调 server（登录结束/超时/取消时调用）。幂等，可重复调用。
+//
+// 容器内用固定端口，若上一次登录的 server 未关，下一次 Start 会端口冲突，
+// 故 Start 之前也会调一次（见 Start）。
 func Shutdown() {
 	srvOnce.Do(func() {})
-	if callbackSrv != nil {
-		_ = callbackSrv.Close()
-		callbackSrv = nil
-		callbackLn = nil
+	cbMu.Lock()
+	ln, srv := callbackLn, callbackSrv
+	callbackLn, callbackSrv = nil, nil
+	cbMu.Unlock()
+	// 先关 listener：容器内是固定端口，`Server.Close()` 只能关到已被 Serve
+	// 注册的 listener，若 Serve 尚未跑起来端口会残留 → 下次 Start 端口冲突。
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if srv != nil {
+		_ = srv.Close()
 	}
 }
 

@@ -70,7 +70,8 @@ Wild-Work 是 WorkBuddy（国内版+国际版）/TraeWork/Qoder 多渠道账号�
 | R41 | **小浣熊协议回调必须由 `main.go` 在初始化前拦截（`--raccoon-callback`）**（2026-10-05） | **背景**：小浣熊「浏览器授权登录」的授权码经自定义深链 `office-raccoon://auth/callback` 回传，实现方式是登录期间临时改写 HKCU 的 `office-raccoon` 注册表命令行为 `"<wild-work.exe>" --raccoon-callback "%1"`。`internal/raccoon` 把 `CallbackFlag` 与 `SaveCallback()` 都写好了，**但 `cmd/wild-work/main.go` 从未解析该 flag** ⇒ Windows 唤起回调子进程后，它当作普通启动又拉了一份 daemon：端口被占（`listen … bind: Only one usage…`）、**且它的启动自愈看到「残留的协议改写」立刻 `RestoreProtocol`+`ClearCallback`** ⇒ 授权码从未落盘，常驻进程轮询到 5 分钟超时。**全程不报错不崩溃**，用户只看到「点完授权但账号没加进来」。**修法**：`main.go` 在 `os.Chdir(workDir())` 之后、**任何初始化（config/日志/服务/托盘）之前** 拦截 `handleRaccoonCallback(os.Args[1:])`，命中即「落盘后 `os.Exit`」，绝不启动第二份服务。**同时**：`windowsgui` 构建无控制台，回调结果必须追加写进 `data/app.log`（否则失败时零线索）。**同类教训**：这与 R34（新增渠道漏 `go xxxSch.Run()`）同族 —— **「声明了却没接线」的疏漏在源码层就能判定**，故补静态回归 `cmd/wild-work/raccoon_callback_test.go`（断言 main.go 调用了 handler、位置在服务初始化前、分支含 `os.Exit`），去掉修复即失败。**附带**：`/api/state` 新增 `login_error` —— 此前前端只看 `login_busy`，把**所有渠道**的登录失败/超时都显示成「登录完成」，正是它掩盖了本次问题；现由 `peekLoginError()` 非破坏式回传真实原因（读取即清空会被 `/api/state` 的其它调用方偷走） |
 | R42 | **渠道本地模型校验必须取「静态表 ∪ 动态目录」的并集**（2026-10-05） | **背景**：raccoon / loomy 都做本地模型名校验（上游对未知模型名**静默回落到默认模型**并返回 200，不校验会让用户以为在用 A、实际扣 B 的额度），但实现只查**静态表**（`KnownModel(id)`）⇒ 上游目录新增的模型会被本地 400 误拒，而**同一个模型正被 `/v1/models` 正常列出**（后者读的是动态目录 `FetchModels` 结果）——表现为「面板列出却调不动」。**实测（2026-10-05）**：raccoon 账户 `/v1/models` 列出 9 个模型，其中 `sn-sensenova-6-8-flash` 调对话被本地 400 `model_not_found`，但直连上游同一模型 **HTTP 200 正常服务**（`sn-sensenova-6-8-flash-lite` 在静态表里、`sn-sensenova-6-8-flash` 不在，二者仅差一个后缀）。**修法**：`fetchCatalog` / `fetchModels` 成功后把目录里的模型名记进 Client（`liveIDs`，**单调扩大、只增不减**——避免目录瞬时抖动把可用模型判成未知），`ChatStream` 改查 `c.knownModel()`（静态表 ∪ liveIDs）。两渠道同款修复 + 回归测试 `TestKnownModelAcceptsLiveCatalog`（去掉并集即失败）。**顺带**：给两个 Client 加 `Base` 字段（默认常量端点，测试注入 httptest 假上游），避免为写这条测试而把 `LLMBase`/`GatewayBase` 从 const 改成 var |
 | R43 | **运行统计（`internal/stats`）与用量流水（`internal/ledger`）是两套并列口径，不合并、不互校**（2026-10-07，PR #71–#73） | **背景**：新增「运行统计」tab 时引入了第二套统计面。分工：`ledger` = 磁盘 JSONL 双流水（`data/ledger/{usage,credit}-*.jsonl`），账号**条目差分**口径，按需扫描聚合（R17）；`stats` = 内存实时 + 按日归档 `data/stats.json`，「今日」口径——消耗走**余额下降差值**、收入走**日志签到事件**（`events.go` 正则解析 `app.log`，因「登录即自动签到」等场景条目晚于入账建立，差值恒 0 漏记）、逐请求 token 走 **usage 帧精确值**（`usage.go`）。**决议**：两者**零共享状态、零互相写入**（stats 仅只读 `ledger.Query(1)` 取当日作废），各自标注口径、互不引用；**数字天然不同是设计而非缺陷**（差值含积分包到期作废，ledger 已拆 spend/expire），**不追求对齐**。**边界**：`ledger` 仍是面板「用量与积分」的数据源与 issue #67 等待修的口径；`stats` 只服务「运行统计」tab。新增统计需求时**先明确归属**（精确拆分→ledger；实时/今日/趋势→stats），**不得**为对齐数字而改动另一侧。**注入纪律**：stats 全部数据输入走**进程内直调**（`allStatuses` / `handler.StickySnapshot` / `ledger.Query`），**不得** HTTP 自环（R13）；`main.go` 须 `go appInst.StartStatsFeeders(sctx)`（漏接线即静默无数据，同 R34 家族） |
-| R44 | **Docker 支持采用「无头 + `/data` 单挂载点 + 强制管理密码」形态**（2026-10-09） | 多阶段 `Dockerfile`（BuildKit 交叉编译、非 root uid 1000、alpine + ca-certificates + tzdata）+ `docker-compose.yml` + `.dockerignore`，镜像 tag 推 GHCR（`.github/workflows/docker.yml`）。要点：① `CMD --no-tray` 恒无头（R12），覆盖 CMD 必须自带；② `ENV WILDWORK_HOME=/data`，数据布局与便携版安装目录 1:1（config.json + auths/ + data/），可整体挂载迁移；③ `TZ=Asia/Shanghai` **必须**——签到调度用 `time.Now()` 本地时区，UTC 容器会把 09:00 签到漂到 17:00；④ 端口映射必然 `0.0.0.0` → 触发 R4 强制管理密码，compose 用 `${VAR:?}` 让未设置直接报错；⑤ **容器内浏览器/CDP 登录不可用**（OAuth 回调打容器内 127.0.0.1、GLM CDP 无浏览器），文档口径定位为「代理服务」：账号在桌面版添加后挂 `auths/`，或用 glm 手工 token；⑥ 配套 main.go 首启修复：首次生成 config.json 后经 `config.Load` 重读，否则 `WILDWORK_*` 环境变量首启不生效（只认文件不认 env 是桌面形态遗留） |
+| R44 | **Docker 支持采用「无头 + `/data` 单挂载点 + 强制管理密码」形态**（2026-10-09） | 多阶段 `Dockerfile`（BuildKit 交叉编译、非 root uid 1000、alpine + ca-certificates + tzdata）+ `docker-compose.yml` + `.dockerignore`，镜像 tag 推 GHCR（`.github/workflows/docker.yml`）。要点：① `CMD --no-tray` 恒无头（R12），覆盖 CMD 必须自带；② `ENV WILDWORK_HOME=/data`，数据布局与便携版安装目录 1:1（config.json + auths/ + data/），可整体挂载迁移；③ `TZ=Asia/Shanghai` **必须**——签到调度用 `time.Now()` 本地时区，UTC 容器会把 09:00 签到漂到 17:00；④ 端口映射必然 `0.0.0.0` → 触发 R4 强制管理密码，compose 用 `${VAR:?}` 让未设置直接报错；⑤ **CDP 类登录容器内不可用**（GLM CDP 无浏览器）；HTTP 回调类登录已可用（见 R45），文档口径仍是「代理服务」（账号也可在桌面版添加后挂 `auths/`）；⑥ 配套 main.go 首启修复：首次生成 config.json 后经 `config.Load` 重读，否则 `WILDWORK_*` 环境变量首启不生效（只认文件不认 env 是桌面形态遗留） |
+| R45 | **本机 OAuth 回调地址必须可配：Listen（进程侧）与 Host（浏览器侧）分开，容器内固定端口并对宿主发布**（2026-10-10） | **背景**：traework / qwenwork 登录要起本机 HTTP 回调收授权码，旧实现硬编码 `net.Listen("tcp","127.0.0.1:0")` + URL 恒写 `127.0.0.1:<随机端口>`，容器里三处同时错位（监听=容器环回、端口随机无从发布、URL 的 127.0.0.1=宿主环回但无人监听）⇒ 浏览器拿到 code 后 connection refused，用户只看到「5 分钟超时」且日志无错。**修法**：新增 `internal/logincb`（`Options{Listen,Host}` + `RedirectURL`）＋配置 `callback.listen` / `callback.host`（env `WILDWORK_CALLBACK_LISTEN` / `WILDWORK_CALLBACK_HOST`），两个渠道显式传入（R14 同款：不靠包级全局记状态）。容器内 `WILDWORK_CALLBACK_LISTEN=0.0.0.0:43903`（bind 0.0.0.0 才能被端口转发命中）＋ compose 发布 `127.0.0.1:43903:43903`（只绑宿主环回，不向局域网暴露），**URL 仍写 `127.0.0.1`**（浏览器在宿主）——故 Listen 与 Host 职责不同、**不得合并成一个值**（监听 0.0.0.0 不可写进 URL）。零值 = 旧行为（`127.0.0.1:0` + `127.0.0.1`），桌面零差异。**必须配套的两件事**：① `Start` 开头先 `Shutdown()`，且 `Shutdown` 关 **listener 本身**——`http.Server.Close()` 只能关到已被 `Serve` 注册的监听，「Start 后立刻取消」时端口会残留 ⇒ 固定端口下下次登录 `address already in use`（实测踩中，已加回归测试）；② `Serve` 必须闭包捕获 sevrer 实例，读包级变量会在 `Shutdown` 置 nil 后 **nil panic**（实测踩中）。**未实测**：`WILDWORK_CALLBACK_HOST` 设为非环回地址（NAS 远程浏览器场景）时上游是否接受该 redirect_uri——同机使用无此问题，环回任意端口已由用户实际回调 URL 证实可用。回归测试：`internal/logincb`、`login_qwenwork`/`login_trae` 的 `callback_listen_test.go`、`config/callback_test.go`、静态接线校验 `cmd/wild-work/docker_callback_test.go`（compose 发布端口 == 容器监听端口） |
 
 ## 2. 架构选型（依据）
 
@@ -210,6 +211,14 @@ POST /api/quit                     # 退出程序
 > SSE 为**增量 delta**（`finish` 帧给全文，见 R25）。登录走 CDP 自动捕获 Cookie（R27/R28），
 > 支持多账号（独立 profile 逐个添加）。详见 `docs/智谱清言渠道接入备忘.md`。
 
+> **登录形态分类（与容器化相关，见 R45 / 不变量 24）**：
+> - **本机 HTTP 回调**：仅 `traework`、`qwenwork`——要起本地监听收授权码，
+>   容器内必须固定端口并发布到宿主（`WILDWORK_CALLBACK_LISTEN` + compose 的 `43903`）；
+> - **上游轮询式**：`workbuddy` / `workbuddyai` / `qoder` / `qodercn` / `qodercom`——浏览器授权后
+>   由上游接口查到结果，不经本地端口，容器内开箱可用；
+> - **导入型**：monkeycode / raccoon / loomy（读本机客户端文件；raccoon 的浏览器授权走系统协议回调，
+>   容器内不可用）；**CDP**：glm（需真浏览器）；**匿名**：oczen。
+
 ## 6. 关键不变量（改动前必读）
 
 0. **每次代码变更后必须本地重新构建 `dist/wild-work.exe`**（见 §8）。
@@ -280,6 +289,18 @@ POST /api/quit                     # 退出程序
       直到全部账号达 `claimed`/`already` 才算当日完成（上游 `ae3d42f` 修的就是漏领一天）。
       完成标记按「日期+时段」而非仅日期——本工具支持一天多时段（09:00/21:00），
       只按日期标记会让早间成功吞掉晚间时段。
+24. **本机 OAuth 回调（traework / qwenwork）的 Listen 与 Host 不得混淆；容器内必须固定端口并对宿主发布**：
+    - `internal/logincb.Options{Listen, Host}` 是两个字段两种职责——`Listen` 是进程 `net.Listen` 地址
+      （容器内必须 `0.0.0.0:43903` 才可能被端口转发命中），`Host` 是写进 redirect_uri 的主机
+      （必须是**浏览器**能连的地址，容器同机场景恒为 `127.0.0.1`）。
+      **严禁把 `0.0.0.0` 写进回调 URL，也严禁用监听地址拼 URL**（旧实现 `ln.Addr().String()` 就是这么错的）。
+    - 容器内回调端口（当前 43903）**必须与 docker-compose 发布端口一致**，否则“没人监听的端口”效果
+      与修复前一样（浏览器 connection refused、登录 5 分钟超时、日志无错）。静态回归：
+      `cmd/wild-work/docker_callback_test.go`（compose 发布端口 == `WILDWORK_CALLBACK_LISTEN` 端口）。
+    - `Start` 必须先 `Shutdown()`，且 `Shutdown` 必须关 **listener 本身**（`Server.Close()` 只关已被
+      `Serve` 注册的监听，Start 后立即取消会残留端口 → 下次 `address already in use`）；
+      `Serve` 必须闭包捕获 server 实例（读包级变量会在 `Shutdown` 置 nil 后 nil panic）。两者均有回归测试。
+    - 零值 `Options` 必须等价于旧桌面行为（`127.0.0.1:0` + `127.0.0.1`），升级不得改变桌面登录链路。
 
 ## 7. 平台能力差异表（internal/platform）
 
@@ -313,8 +334,10 @@ docker build -t wild-work .        # 本地构建镜像
 docker compose up -d --build       # 构建 + 启动（需先设 WILDWORK_ADMIN_PASSWORD，见 README）
 ```
 
-镜像约束与形态见 R44；发版 tag（v*）另由 `.github/workflows/docker.yml` 构建
+镜像约束与形态见 R44/R45；发版 tag（v*）另由 `.github/workflows/docker.yml` 构建
 linux/amd64+arm64 镜像推 GHCR。容器内健康检查打 `/healthz`（改监听端口需同步覆盖）。
+**OAuth 回调端口（43903）**：compose 已发布 `127.0.0.1:43903:43903`；改容器内
+`WILDWORK_CALLBACK_LISTEN` 时必须同步改发布端口（静态回归会拦）。
 
 构建后核对版本号已进二进制（防止拿到旧文件）：
 
@@ -342,7 +365,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 
 - [README.md](README.md) — 用户文档
 - [DEVELOPMENT.md](DEVELOPMENT.md) — 开发者文档（面向 AI Agent）
-- [AGENTS.md](AGENTS.md) — 本文件：决议项（R1–R44）、架构选型、不变量
+- [AGENTS.md](AGENTS.md) — 本文件：决议项（R1–R45）、架构选型、不变量
 - [docs/三接口兼容改造备忘.md](docs/三接口兼容改造备忘.md) — 三接口（Chat/Responses/Anthropic）兼容层架构决策、实施记录、验证清单、已知限制
 - [docs/用量积分流水记账备忘.md](docs/用量积分流水记账备忘.md) — 双流水统计（token/积分）架构、差分算法、实测验证、已知限制（R17）
 

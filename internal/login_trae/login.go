@@ -15,9 +15,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"wild-work/internal/auth"
+	"wild-work/internal/logincb"
 	"wild-work/internal/traework"
 )
 
@@ -49,6 +51,60 @@ type state struct {
 
 func NewClient() *http.Client { return &http.Client{Timeout: 30 * time.Second} }
 
+// 当前活动的回调 server。
+//
+// 容器内回调是**固定端口**（logincb），故必须能从外部关掉：否则上一次登录
+// 取消后监听会多挂 5 分钟，期间任何渠道再登录都是 listen: address in use。
+var (
+	srvMu     sync.Mutex
+	activeSrv *http.Server
+	activeLn  net.Listener // 与 activeSrv 配对；固定端口必须能直接关到它
+)
+
+// setActive 挂上本次登录的回调 server 与监听。
+func setActive(s *http.Server, ln net.Listener) {
+	srvMu.Lock()
+	activeSrv, activeLn = s, ln
+	srvMu.Unlock()
+}
+
+// shutdownSrv 优雅关闭指定 server（幂等），若它仍是活动的那个则清引用并关端口。
+func shutdownSrv(s *http.Server) {
+	if s == nil {
+		return
+	}
+	srvMu.Lock()
+	var ln net.Listener
+	if activeSrv == s {
+		ln = activeLn
+		activeSrv, activeLn = nil, nil
+	}
+	srvMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = s.Shutdown(ctx)
+	if ln != nil {
+		_ = ln.Close()
+	}
+}
+
+// Shutdown 立即关闭本渠道登录回调监听（登录取消/结束时由 app 调用）。幂等。
+//
+// 必须直接关 listener：`Server.Close()` 只关已被 Serve 注册的监听，若 Serve
+// 还没跑起来（Start 刚返回就取消），端口会残留 → 下一次 Start 直接端口冲突。
+func Shutdown() {
+	srvMu.Lock()
+	s, ln := activeSrv, activeLn
+	activeSrv, activeLn = nil, nil
+	srvMu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if s != nil {
+		_ = s.Close()
+	}
+}
+
 // Start 启动本地一次性回调监听，返回 Trae 授权 URL。
 //
 // 设备号作用域是「登录会话」，不是「本机」（issue #60/#70，R37 第二次修订）：
@@ -63,16 +119,23 @@ func NewClient() *http.Client { return &http.Client{Timeout: 30 * time.Second} }
 //
 // 注意：不能复用 login-state.json 本身——它承载的一次性登录状态（authCode/verifier）
 // 在登录成功/取消时会被删除。
-func Start(client *http.Client, statePath string) (string, error) {
+func Start(client *http.Client, statePath string, cb logincb.Options) (string, error) {
 	machineID := randHex(32)                          // 真实客户端 64 位 hex（32 字节）
 	deviceID := randNumericID()                       // 真实客户端 15 位数字设备 ID（首次绑定随机产生）
 	codeVerifier, codeChallenge := traework.GenPKCE() // PKCE：verifier 必须保存，交换 AuthCode 时用
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+
+	// 固定端口（容器）时上一次未关的回调会占着端口：先关一次（幂等）。
+	Shutdown()
+
+	lnAddr := cb.ListenAddr()
+	ln, err := net.Listen("tcp", lnAddr)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("listen callback (%s): %w", lnAddr, err)
 	}
-	addr := ln.Addr().String()
-	callback := "http://" + addr + "/authorize"
+	// 回调 URL 必须用「浏览器侧可见」的主机：0.0.0.0 监听时 URL 写 0.0.0.0 是非法的，
+	// 而容器内127.0.0.1 是容器自身，宿主浏览器够不着（见 logincb 包注释）。
+	port := ln.Addr().(*net.TCPAddr).Port
+	callback := cb.RedirectURL(port, "/authorize")
 	st := state{MachineID: machineID, DeviceID: deviceID, CodeVerifier: codeVerifier}
 	if err := writeState(statePath, st); err != nil {
 		_ = ln.Close()
@@ -116,18 +179,15 @@ func Start(client *http.Client, statePath string) (string, error) {
 		// 统一回调页：有凭证即成功态（自动关）；无凭证为失败态（展示原因）
 		ok := st.Err == ""
 		_, _ = w.Write([]byte(callbackPage(ok, st.Err)))
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			_ = srv.Shutdown(ctx)
-		}()
+		go shutdownSrv(srv)
 	})
+	setActive(srv, ln)
 	go func() { _ = srv.Serve(ln) }()
 	go func() {
+		// 放弃等待（用户没完成授权）时也要把端口还回来：容器里是固定端口，
+		// 占着会让下一次登录（换渠道也一样）Start 即端口冲突。
 		time.Sleep(5 * time.Minute)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
+		shutdownSrv(srv)
 	}()
 
 	u, _ := url.Parse(traework.ConsoleHost + "/authorization")

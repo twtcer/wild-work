@@ -45,12 +45,17 @@ COPY --from=build /out/wild-work /usr/local/bin/wild-work
 
 # TZ：签到调度时区（镜像默认上海，可 -e TZ=... 覆盖）
 # WILDWORK_HOME：数据根目录（main.workDir() 优先读它），改动需同步 VOLUME 与挂载点
+# WILDWORK_CALLBACK_LISTEN：OAuth 本机回调（traework/qwenwork）——容器内必须绑
+# 0.0.0.0 且固定端口，运行时需把该端口发布到宿主（docker run -p 127.0.0.1:43903:43903
+# 或 compose 已配好），否则浏览器拿 code 后 connection refused（见 internal/logincb）。
 ENV TZ=Asia/Shanghai \
-    WILDWORK_HOME=/data
-
+    WILDWORK_HOME=/data \
+    WILDWORK_CALLBACK_LISTEN=0.0.0.0:43903
 WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 7863
+# OAuth 本机回调端口（与 WILDWORK_CALLBACK_LISTEN 一致；发布方式见上）
+EXPOSE 43903
 
 # 非 root（uid 1000）运行：/data 挂载点需对 uid 1000 可写——Linux 主机
 # `mkdir -p wildwork-data && sudo chown 1000:1000 wildwork-data`，

@@ -1441,10 +1441,16 @@ function bind() {
     const v = $("apiAddr").querySelector(".val").textContent;
     copyText(v, "OpenAI 接口地址");
   };
-  $("apiKeyDisplay").onclick = () => {
+  const copyApiKey = (e) => {
+    if (e) e.stopPropagation(); // 避免点击按钮再冒泡到 info-value 触发第二次复制
     const v = $("apiKeyDisplay").querySelector(".val").textContent;
     if (v === "（无鉴权）") { toast("当前未设置 API-Key"); return; }
     copyText(v, "API-Key");
+  };
+  $("apiKeyDisplay").onclick = copyApiKey;
+  $("btnCopyApiKey").onclick = copyApiKey;
+  $("btnCopyApiKey").onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); copyApiKey(e); }
   };
   // 顶栏齿轮进入统一设置（点击地址/Key 文本仍为复制）
   $("btnSettings").onclick = openSettings;
