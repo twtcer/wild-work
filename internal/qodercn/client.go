@@ -63,27 +63,12 @@ func NewWithTimeout(timeout time.Duration) *Client {
 	return &Client{
 		HTTP:        &http.Client{Timeout: timeout, Transport: tr},
 		StreamHTTP:  &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
-		IdleTimeout: idle.DefaultTimeout,          // 流中空闲监控兜底（见 internal/idle）
+		IdleTimeout: idle.DefaultTimeout,         // 流中空闲监控兜底（见 internal/idle）
 		Base:        OpenAPIBase,
 		Gateway:     GatewayBase,
 		modelMap:    map[string]string{},
 		userTypes:   map[string]string{},
 	}
-}
-
-// NewWithBase 测试用：覆盖 base/gateway。
-func NewWithBase(base, gateway string) *Client {
-	c := New()
-	c.Base = base
-	c.Gateway = gateway
-	return c
-}
-
-// setModelMap 记录动态模型映射（客户端名 → key）。
-func (c *Client) setModelMap(m map[string]string) {
-	c.modelMu.Lock()
-	c.modelMap = m
-	c.modelMu.Unlock()
 }
 
 // modelKey 客户端模型名 → 上游 model key：动态映射优先；
@@ -166,18 +151,6 @@ func billingHeaders(req *http.Request, dt string) {
 
 func (c *Client) get(path, dt string) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, c.Base+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	billingHeaders(req, dt)
-	return c.HTTP.Do(req)
-}
-
-func (c *Client) post(path, dt string, body []byte) (*http.Response, error) {
-	if body == nil {
-		body = []byte("{}")
-	}
-	req, err := http.NewRequest(http.MethodPost, c.Base+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -299,6 +272,8 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	}
 
 	// 思考开关：reasoning_effort 或 thinking:{type:"enabled"} → 启用推理
+	// 档位值（low/high/max/...）原样透传到 parameters.reasoning_effort；
+	// "none" 是关闭思考的语义值，同时负责把 is_reasoning 置 false。
 	enableReasoning := false
 	if reqOpenAI.ReasoningEffort != "" {
 		enableReasoning = true
@@ -310,7 +285,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	mc := c.modelEntry(modelKey)
 	contextWindow := resolveContextWindow(parseContextWindowHint(body), mc)
 
-	rawBody, err := buildAgentBody(reqOpenAI.Messages, mc, reqOpenAI.Tools, enableReasoning, reqOpenAI.MaxTokens, c.userTypeOf(a), contextWindow)
+	rawBody, err := buildAgentBody(reqOpenAI.Messages, mc, reqOpenAI.Tools, enableReasoning, reqOpenAI.ReasoningEffort, reqOpenAI.MaxTokens, c.userTypeOf(a), contextWindow)
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("build qodercn body: %w", err)
 	}
@@ -482,8 +457,30 @@ func Classify(status int, body string) provider.ErrKind {
 	if status == http.StatusUnauthorized {
 		return provider.ErrSessionDead
 	}
+	// 排队提示（10605 isQueued）：就算外层是 4xx（实测 403），语义也是「等一会儿再来」，
+	// 换号可能命中不同队列 ⇒ 独立类别，冷却「号×模型」而不是罚整号（见 provider.Queued）。
+	if strings.Contains(body, "10605") || strings.Contains(body, "isQueued") {
+		return provider.ErrQueued
+	}
+	// 账号额度耗尽（qodercom 同族实测 110「Billing daily count exceeded」/ 112 付费墙）：
+	// 文案不含 hardMarkers 的 "quota exceeded"，必须显式列码。
+	if strings.Contains(body, `"code":"110"`) || strings.Contains(body, `"code":"112"`) ||
+		strings.Contains(body, `\"code\":\"110\"`) || strings.Contains(body, `\"code\":\"112\"`) ||
+		strings.Contains(body, "pricingUrl") {
+		return provider.ErrHardCredit
+	}
 	// 429 优先于 hardRule：限流 body 高频带 "quota exceeded"。
 	if status == http.StatusTooManyRequests {
+		return provider.ErrSoftRate
+	}
+	// 上游以 HTTP 200 包裹的排队/限流拒绝：内嵌 403 + subCode:RESOURCE_LIMIT
+	// （业务码 10605，带 retryAfterSeconds/waitTime/serviceAvailable:false）。
+	// 必须排在「403 且 body 为空 → ErrWafBlock」与 4xx 兜底之前，否则落 ErrClient
+	// ——既不罚账号也不进流错误分类，客户端只看到一条被空闲看门狗掐成的截断流（R108）。
+	// 10605 走 provider.CodeMarker 而非裸 Contains：错误文本里的 trace_id/requestId
+	// 常含五位数字，裸匹配会把无关失败误判成限流（与 11115 同一教训）。
+	if strings.Contains(body, "RESOURCE_LIMIT") ||
+		(strings.Contains(body, "serviceAvailable") && provider.CodeMarker(lower, "10605")) {
 		return provider.ErrSoftRate
 	}
 	for _, m := range hardMarkers {

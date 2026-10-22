@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +33,9 @@ type Client struct {
 	// 空闲兜底改由 IdleReader 承担。
 	StreamHTTP *http.Client
 	// IdleTimeout 流式空闲超时：连续该时长读不到任何字节即判上游卡死。
-	// 0 = 用 DefaultIdleTimeout。由 main 装配时注入 config.upstream.stream_idle_seconds。
+	// 0 = 用 DefaultIdleTimeout。⚠️ 目前**没有配置项**（main 不注入），实际恒为默认值。
+	// 注意它只管「拿到响应头之后」那段；等响应头另由 Transport.ResponseHeaderTimeout
+	// 兜底（R118：≥180s，本渠道上游首字节常态 60~100s）。
 	IdleTimeout time.Duration
 
 	// liveMu 保护 liveIDs（动态目录缓存）。
@@ -47,6 +50,9 @@ type Client struct {
 
 	// Base 网关基址（默认 LLMBase）；测试注入 httptest 假上游用，生产不设。
 	Base string
+	// AuthBase 认证/业务基址（默认 BaseURL）；仅测试注入用，生产不设。
+	// 与 Base 分开：刷新走站点根前缀（/api/web/auth/v1/refresh），而推理走 /api/web/llm/v2。
+	AuthBase string
 }
 
 // baseURL 生效的网关基址。
@@ -57,20 +63,51 @@ func (c *Client) baseURL() string {
 	return LLMBase
 }
 
+// authBaseURL 生效的认证/业务基址（refresh / 积分等站点根前缀接口）。
+func (c *Client) authBaseURL() string {
+	if b := strings.TrimRight(strings.TrimSpace(c.AuthBase), "/"); b != "" {
+		return b
+	}
+	return BaseURL
+}
+
 // DefaultIdleTimeout 流式空闲超时默认值（与 loomy 对齐，见其注释）。
 const DefaultIdleTimeout = 90 * time.Second
 
-// New 默认 180s 超时的客户端（仅作用于非流式调用；流式见 StreamHTTP）。
-func New() *Client { return NewWithTimeout(180 * time.Second) }
+// 等响应头（TTFB）的上限与硬下限（R118）。
+//
+// 为什么必须 ≥180s：小浣熊的 LLM 网关是**缓冲式**的——即便请求带 stream:true，
+// 它也要等深度思考跑到一定阶段才回首字节。2026-10-21 本机实测（同账号同模型、
+// `max_tokens:64` 的极短请求）TTFB 三次为 64.9s / 102.9s / 95.0s。旧 60s 会把正常
+// 请求稳定判死：日志 235 次 `net/http: timeout awaiting response headers`，每次距
+// 派发精确 60.0s，用户侧表现为随机 502（同一账号、同一模型时而成功时而失败）。
+const (
+	// defaultHeaderTimeout 等响应头的默认上限。
+	defaultHeaderTimeout = 180 * time.Second
+	// minHeaderTimeout 等响应头的硬下限：再小就是把正常请求判死（有反向护栏测试）。
+	minHeaderTimeout = 180 * time.Second
+)
 
-// NewWithTimeout 指定非流式超时。
+// New 默认下限配置的客户端（仅作用于非流式调用；流式见 StreamHTTP）。
+func New() *Client { return NewWithTimeout(defaultHeaderTimeout) }
+
+// NewWithTimeout 指定非流式整请求超时。
+//
+// 等响应头上限 = max(minHeaderTimeout, timeout)：非流式总超时调得比 180s 宽时
+// 响应头跟着放宽，但它**不能**被调低——`upstream.timeout_seconds` 是为「整条请求」
+// 设的，若拿它去压响应头这一段，大问题（长思考首字节 100s+）会重新变成必然失败。
+// 流中空闲看门狗（IdleTimeout）刻意不跟着放宽，与 R58/R110 同口径。
 func NewWithTimeout(timeout time.Duration) *Client {
 	if timeout <= 0 {
-		timeout = 180 * time.Second
+		timeout = defaultHeaderTimeout
+	}
+	headerTimeout := defaultHeaderTimeout
+	if timeout > headerTimeout {
+		headerTimeout = timeout
 	}
 	return &Client{
-		HTTP:       &http.Client{Timeout: timeout, Transport: newTransport()},
-		StreamHTTP: &http.Client{Transport: newTransport()},
+		HTTP:       &http.Client{Timeout: timeout, Transport: newTransport(headerTimeout)},
+		StreamHTTP: &http.Client{Transport: newTransport(headerTimeout)},
 	}
 }
 
@@ -79,7 +116,10 @@ func NewWithTimeout(timeout time.Duration) *Client {
 // ⚠️ 此前本包 `&http.Client{Timeout: ...}` 未设 Transport，实际在共用 http.DefaultTransport
 // （h2 开启、无 ResponseHeaderTimeout）。StreamHTTP 无总超时后**必须**有
 // ResponseHeaderTimeout 兜底，否则连响应头都等不到就会无限挂住。
-func newTransport() *http.Transport {
+func newTransport(headerTimeout time.Duration) *http.Transport {
+	if headerTimeout <= 0 {
+		headerTimeout = defaultHeaderTimeout
+	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
 	return &http.Transport{
 		DialContext:           dialer.DialContext,
@@ -88,7 +128,7 @@ func newTransport() *http.Transport {
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       30 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: headerTimeout,
 	}
 }
 
@@ -96,7 +136,7 @@ func newTransport() *http.Transport {
 // 仍有总超时：这些是短请求，总超时是恰当的兜底。
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP == nil {
-		c.HTTP = &http.Client{Timeout: 180 * time.Second, Transport: newTransport()}
+		c.HTTP = &http.Client{Timeout: defaultHeaderTimeout, Transport: newTransport(0)}
 	}
 	return c.HTTP
 }
@@ -104,7 +144,7 @@ func (c *Client) httpClient() *http.Client {
 // streamClient 返回流式调用用的客户端（无总超时）。
 func (c *Client) streamClient() *http.Client {
 	if c.StreamHTTP == nil {
-		c.StreamHTTP = &http.Client{Transport: newTransport()}
+		c.StreamHTTP = &http.Client{Transport: newTransport(0)}
 	}
 	return c.StreamHTTP
 }
@@ -155,24 +195,37 @@ func (c *Client) do(method, url string, a *auth.Auth, body []byte) (*http.Respon
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	rt := strings.TrimSpace(a.RefreshTokenValue())
 	if rt == "" {
+		// 本地无 refresh 可用：客户端文件里可能有活凭证（本渠道与客户端共用会话）。
+		if rerr := RescueFromClientSession(a); rerr == nil {
+			log.Printf("raccoon: 本地 refresh 为空，已采纳本机客户端最新令牌 uid=%s", a.UID)
+			return nil
+		}
 		return fmt.Errorf("raccoon: 无 refresh token，需重新从客户端导入凭据")
 	}
 	payload, err := json.Marshal(map[string]string{"refresh_token": rt})
 	if err != nil {
 		return err
 	}
-	resp, raw, err := c.do(http.MethodPost, BaseURL+EpAuthRefresh, a, payload)
+	// 先试 web 前缀：2026-10-10 实测它是唯一可用端点（electron 旧前缀已 404）。
+	// 404 时回落 electron 前缀，兼容更早的上游版本。
+	base := c.authBaseURL()
+	resp, raw, err := c.do(http.MethodPost, base+EpAuthRefreshWeb, a, payload)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		// 桌面端前缀 /api/electron/auth/v1 与代码兜底 /api/web/auth/v1 在不同版本上不同，逐个尝试。
-		resp, raw, err = c.do(http.MethodPost, BaseURL+EpAuthRefreshWeb, a, payload)
+		resp, raw, err = c.do(http.MethodPost, base+EpAuthRefresh, a, payload)
 		if err != nil {
 			return err
 		}
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// 401/403 的最常见成因：与客户端共用的会话被客户端续期轮换作废（客户端文件里
+		// 始终持有唯一活凭证）。先尝试本机自救，成功即视为刷新成功（调用方会 SaveAtomic）。
+		if rerr := RescueFromClientSession(a); rerr == nil {
+			log.Printf("raccoon: refresh 被拒（疑客户端轮换），已采纳本机客户端最新令牌 uid=%s", a.UID)
+			return nil
+		}
 		return &provider.Error{Kind: provider.ErrSessionDead, Status: resp.StatusCode, Msg: truncate(string(raw), 300)}
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -198,6 +251,19 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	a.ExpiresAt = jwtExp(out.Data.AccessToken)
 	a.Unlock()
 	return nil
+}
+
+// RefreshWithToken 用给定的 refresh_token 换新令牌（不依赖已有 Auth 实例）。
+//
+// 供「网页版登录」在 CDP 捕获 Cookie 后完成**有效性校验 + 令牌获取**两步：
+// 上游 refresh 会轮换 refresh_token，故返回的 refresh 通常与传入值不同，调用方必须落盘
+// （AGENTS §6.20：凡调 RefreshToken 必紧跟 SaveAtomic）。
+func (c *Client) RefreshWithToken(refreshToken string) (access, refresh string, err error) {
+	a := &auth.Auth{RefreshToken: strings.TrimSpace(refreshToken)}
+	if err := c.RefreshToken(a); err != nil {
+		return "", "", err
+	}
+	return a.AccessTokenValue(), a.RefreshTokenValue(), nil
 }
 
 // jwtExp 从 JWT 取 exp（Unix 秒）；解析失败返回 0（NeedsRefresh 会视作需刷新）。
@@ -398,11 +464,8 @@ type catalogModel struct {
 	ModelName         string   `json:"model_name"`
 	Description       string   `json:"description"`
 	DisplayDesc       string   `json:"display_description"`
-	Visible           bool     `json:"visible"`
-	BillingCategory   string   `json:"billing_category"`
 	BillingMultiplier float64  `json:"billing_multiplier"`
 	Tags              []string `json:"tags"`
-	AbilityLevel      int      `json:"ability_level"`
 	Params            struct {
 		ContextWindow int64 `json:"context_window"`
 		MaxTokens     int64 `json:"max_tokens"`
@@ -537,14 +600,59 @@ type pointsBalanceResp struct {
 	Data pointsBalanceData `json:"data"`
 }
 
+// pointsBill /api/web/points/v1/bills 的单条积分流水（2026-10-20 实测字段）。
+//
+// biz_type 实测四种：`daily_grant`（每日积分发放）/ `daily_expire`（每日积分到期清零）/
+// `desktop`（桌面端 LLM 对话消耗）/ `reward_grant`（活动/补偿发放）。
+// 只有 daily_grant 带 `expire_at`（= 发放日 +6 天 23:59:59，即「7 天有效」），
+// 其余类型无到期字段。
+type pointsBill struct {
+	BizType   string `json:"biz_type"`
+	Points    int64  `json:"points"`
+	GrantAt   string `json:"grant_at"`   // 名义发放时刻（每日积分恒为当天 00:00）
+	ExpireAt  string `json:"expire_at"`  // 该笔额度的失效时刻（仅 daily_grant 有）
+	CreatedAt string `json:"created_at"` // 实际落账时刻（惰性发放，见 checkin.go）
+}
+
+// pointsBillsResp /api/web/points/v1/bills 的响应。
+// 分页用 `paging.limit` / `paging.offset`（`type` 之类参数会 400）；服务端另有
+// 返回条数上限（实测 limit=1000 只回 61 条），故本渠道只取最近一页即可——
+// 每日积分 7 天窗口最多 8 笔在效发放。
+type pointsBillsResp struct {
+	Code int `json:"code"`
+	Data struct {
+		Items []pointsBill `json:"items"`
+	} `json:"data"`
+}
+
+// dailyItemName 每日额度条目的展示名。**必须保持不变**：ledger 的差分键在 Key 为空时
+// 退回 Name（见 ledger.itemKey），改名等于换键 ⇒ 升级瞬间旧键「消失」记 expire、
+// 新键「出现」记 earn，凭空产出一对假流水（R105 的伪键纪律）。
+const dailyItemName = "每日额度"
+
+// dailyGrant 一笔在效的每日积分发放（bills 的 daily_grant 里未到期的那部分）。
+type dailyGrant struct {
+	Points   int64
+	ExpireAt string // RFC3339 精确时刻（上游原样）
+}
+
 // UserResourceDetail 实现 provider.Upstream：拉取积分余额并按上游的池子拆分条目。
 //
 // 端点 `GET {站点根}/api/web/points/v1/balance`（**与推理网关不同前缀**：推理在
 // `/api/web/llm/v2`，积分在 `/api/web/points/v1`）。上游把额度分成四个池：
 // 每日 / 月度 / 奖励 / 充值，另有 `topup_frozen` 标记充值池是否被冻结 —— 冻结时该池
 // 对用户「看得见用不了」，正好对应 `provider.ResourceItem.Usable` 的语义。
+//
+// 基址走 `authBaseURL()`（与签到、refresh 同源）：points 是**站点根**服务，不是推理网关，
+// 用 AuthBase 而不是 Base —— 两者在生产都是 `BaseURL`，但只有前者能在 httptest 里注入。
+//
+// **每日额度额外补一次 bills 查询拿逐笔到期时刻**（R107）：balance 只给聚合值，
+// 不给任何到期信息；而「每日积分 7 天有效、逐日滚动清零」是这个渠道最常见的
+// 余额下降原因。不补到期时刻时，账本会把「过期清零」无条件记成「对话消耗」——
+// 2026-10-20 生产实录：面板显示小浣熊「今日消耗 580」，上游 bills 实为
+// 三账号各一笔 `daily_expire`（-200/-191/-189），当天真实对话请求 0 次。
 func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceItem, error) {
-	resp, raw, err := c.do(http.MethodGet, BaseURL+EpPointsBalance, a, nil)
+	resp, raw, err := c.do(http.MethodGet, c.authBaseURL()+EpPointsBalance, a, nil)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -567,24 +675,142 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 		return 0, nil, &provider.Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 300)}
 	}
 	remain, items := parsePointsBalance(out.Data)
+	// 逐笔到期是**尽力而为**：bills 查询失败只降级成「无到期信息」（退回旧口径，
+	// 不阻塞余额主流程），绝不因为一个锦上添花的展示维度把积分刷新整个搞挂。
+	if grants, gerr := c.fetchDailyGrants(a); gerr == nil {
+		items = withDailyExpiry(items, grants)
+	} else {
+		log.Printf("raccoon 每日额度到期查询失败（本轮退回无到期口径）uid=%s err=%v", a.UID, gerr)
+	}
 	return remain, items, nil
+}
+
+// fetchDailyGrants 拉取「仍在有效期内」的每日积分发放，按**到期时刻升序**返回。
+//
+// 为什么要按到期升序：上游每日 300 分、7 天有效 ⇒ 池子里同时躺着最多 8 笔不同
+// 到期日的额度，且消耗按**先进先出**（最老的一笔先被花掉，实测：三账号 10-13
+// 那笔各花掉 100/109/111，其后的发放笔笔满额，到期清零额恰好等于老笔的剩余）。
+// 升序即「消耗顺序」，供 withDailyExpiry 做先进先出拆分。
+func (c *Client) fetchDailyGrants(a *auth.Auth) ([]dailyGrant, error) {
+	resp, raw, err := c.do(http.MethodGet, c.authBaseURL()+EpPointsBills+"?paging.limit=50&paging.offset=0", a, nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &provider.Error{
+			Kind: Classify(resp.StatusCode, string(raw)), Status: resp.StatusCode, Msg: truncate(string(raw), 300),
+		}
+	}
+	var out pointsBillsResp
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("raccoon 积分流水解析失败: %w (%s)", err, truncate(string(raw), 200))
+	}
+	if out.Code != 0 {
+		return nil, fmt.Errorf("raccoon 积分流水业务码 %d: %s", out.Code, truncate(string(raw), 200))
+	}
+	now := time.Now()
+	grants := make([]dailyGrant, 0, 8)
+	for _, b := range out.Data.Items {
+		if b.BizType != "daily_grant" || b.Points <= 0 || b.ExpireAt == "" {
+			continue
+		}
+		// 已到期的发放不再参与：它们对应的额度早已被上游清零并从池子里扣掉，
+		// 留在列表里会让「按到期升序」的第一笔永远是过期笔，把今日到期算成 0。
+		if t, ok := provider.ExpireInstant(b.ExpireAt); ok && !now.Before(t) {
+			continue
+		}
+		grants = append(grants, dailyGrant{Points: b.Points, ExpireAt: b.ExpireAt})
+	}
+	sort.Slice(grants, func(i, j int) bool {
+		ti, oki := provider.ExpireInstant(grants[i].ExpireAt)
+		tj, okj := provider.ExpireInstant(grants[j].ExpireAt)
+		if !oki || !okj {
+			return grants[i].ExpireAt < grants[j].ExpireAt
+		}
+		return ti.Before(tj)
+	})
+	return grants, nil
+}
+
+// withDailyExpiry 把聚合的「每日额度」条目换成**逐笔发放**的条目，各带自己的到期时刻。
+//
+// 两个约束同时成立，这是本函数存在的全部理由：
+//
+//  1. **面板要逐笔**：`stats.expiryItems` 是逐条目分桶的，只有拆开才能算出
+//     「今晚 300 到期 / 7 日内 2100 到期」；不拆就只能整池挂一个最早到期日，
+//     把 2100 全报成「今日到期」（虚高 7 倍，属于编造）。
+//  2. **账本要单键**：所有拆分条目共用同一个 Name 且**不设 Key**，`ledger.DiffCredits`
+//     的按 key 聚合（remain/used/total 求和、expire 取首个非空）会把它们合回
+//     「每日额度」一条 —— 与拆分前完全同键同值，升级零假流水；同时聚合后的
+//     Expire 取到的是**最早**那一笔的到期时刻，正好是 `ledger.expired()` 需要的判据
+//     （最早一笔过期 ⇒ 本轮余额下降归因 expire 而非 spend）。
+//
+// 余额拆分口径：池子总额（daily_points）按到期升序逐笔扣减（先进先出），最后一笔
+// 承接全部余量 —— 保证拆分后 Remain 之和恒等于 daily_points（`provider.Summarize`
+// 与 pool 快照据此取值，差一分都会让面板与余额对不上）。
+func withDailyExpiry(items []provider.ResourceItem, grants []dailyGrant) []provider.ResourceItem {
+	idx := -1
+	for i, it := range items {
+		if it.Name == dailyItemName {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || len(grants) == 0 {
+		return items
+	}
+	daily := items[idx]
+	if daily.Remain <= 0 {
+		return items // 池子已空：没有可拆的余额，也就没有可展示的到期
+	}
+
+	budget := daily.Remain
+	split := make([]provider.ResourceItem, 0, len(grants))
+	for _, g := range grants {
+		take := g.Points
+		if take > budget {
+			take = budget // 池子不够：本笔已被花掉一部分
+		}
+		if take <= 0 {
+			continue
+		}
+		split = append(split, provider.ResourceItem{
+			Name: dailyItemName, Total: take, Remain: take,
+			ExpireAt: g.ExpireAt, Usable: daily.Usable,
+		})
+		budget -= take
+		if budget <= 0 {
+			break
+		}
+	}
+	if len(split) == 0 {
+		return items
+	}
+	if budget > 0 {
+		// 上游口径漂移（池子比 bills 里在效发放之和还大）：余量挂到**最新**那一笔上，
+		// 保证 Remain 之和仍等于 daily_points。宁可到期日略偏，也不让余额对不上。
+		last := &split[len(split)-1]
+		last.Total += budget
+		last.Remain += budget
+	}
+
+	out := make([]provider.ResourceItem, 0, len(items)-1+len(split))
+	out = append(out, items[:idx]...)
+	out = append(out, split...)
+	out = append(out, items[idx+1:]...)
+	return out
 }
 
 // parsePointsBalance 把上游余额结构转成 (可用余额, 明细条目)。
 // 抽成纯函数便于单测（Client 的 baseURL 是常量，不便在测试里换 host）。
 func parsePointsBalance(d pointsBalanceData) (int64, []provider.ResourceItem) {
 	items := []provider.ResourceItem{
-		{Name: "每日额度", Total: d.DailyPoints, Remain: d.DailyPoints, Usable: true},
+		{Name: dailyItemName, Total: d.DailyPoints, Remain: d.DailyPoints, Usable: true},
 		{Name: "奖励积分", Total: d.RewardPoints, Remain: d.RewardPoints, Usable: true},
 		{Name: "充值积分", Total: d.TopupPoints, Remain: d.TopupPoints, Usable: !d.TopupFrozen},
 		{Name: "月度积分", Total: d.MonthlyPoints, Remain: d.MonthlyPoints, Usable: true},
 	}
 	return d.AvailablePoints, items
-}
-
-// DailyCheckin 实现 provider.Upstream：小浣熊无签到活动。
-func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return fmt.Errorf("raccoon 无签到活动")
 }
 
 // ---------------------------------------------------------------------------

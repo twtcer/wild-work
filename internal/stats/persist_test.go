@@ -14,11 +14,16 @@ import (
 // 保留 token_days/req_days 历史；flush 一次后即转为新格式。
 func TestLoadLegacyStatsJSON(t *testing.T) {
 	dir := t.TempDir()
-	legacy := `{
-  "token_days": {"2026-09-20": 12345},
-  "req_days": {"2026-09-20": 7},
-  "accts": {"370999939580348": "2026-09-21T22:06:12+08:00"}
-}`
+	// 日期必须相对「今天」取：Days30 走 30 日滚动窗口，硬编码日期会在满 30 天后
+	// 静默掉出窗口（2026-10-21 实测 days30=0 → 本测试与 TestLoadBOMTolerance 双双失败，
+	// 与代码无关，纯粹是 fixture 的时间炸弹）。-3 天保证落在窗口内且不贴近边界。
+	day := time.Now().AddDate(0, 0, -3).Format("2006-01-02")
+	burn := time.Now().AddDate(0, 0, -2).Format(time.RFC3339)
+	legacy := fmt.Sprintf(`{
+  "token_days": {%q: 12345},
+  "req_days": {%q: 7},
+  "accts": {"370999939580348": %q}
+}`, day, day, burn)
 	if err := os.WriteFile(filepath.Join(dir, "stats.json"), []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +44,7 @@ func TestLoadLegacyStatsJSON(t *testing.T) {
 	s.flushLocked()
 	s.mu.Unlock()
 	raw, _ := os.ReadFile(filepath.Join(dir, "stats.json"))
-	if bytes.Contains(raw, []byte(`"2026-09-21T22:06:12`)) {
+	if bytes.Contains(raw, []byte(`"`+burn)) {
 		t.Fatalf("落盘后不应残留旧字符串格式: %s", raw)
 	}
 }
@@ -51,10 +56,10 @@ func TestLoadBOMTolerance(t *testing.T) {
 	today := time.Now().Format("2006-01-02")
 	now := time.Now().Format(time.RFC3339)
 	body := fmt.Sprintf(`{
-  "token_days": {"2026-09-20": 100},
+  "token_days": {%q: 100},
   "req_days": {},
   "accts": {"a1": {"day": %q, "burn_since": %q, "credit_out": 42}}
-}`, today, now)
+}`, today, today, now)
 	raw := append([]byte("\xef\xbb\xbf"), []byte(body)...)
 	if err := os.WriteFile(filepath.Join(dir, "stats.json"), raw, 0o644); err != nil {
 		t.Fatal(err)
@@ -139,9 +144,9 @@ func TestModelPersistence(t *testing.T) {
 	}
 	// 用真实「今日」驱动（day 守卫以 New 时的本地日为基准，固定日期会被判跨天残留）
 	day1 := time.Now()
-	s.AddUsage("workbuddy/m1", 30, 20, 0.5, 600, 2, day1)
-	s.AddUsage("workbuddy/m1", 10, 5, 0.25, 400, 1, day1)
-	s.AddUsage("traework/m2", 100, 50, 0, 900, 5, day1)
+	s.AddUsage("workbuddy/m1", 30, 20, 0.5, 600, 2, 0, false, day1)
+	s.AddUsage("workbuddy/m1", 10, 5, 0.25, 400, 1, 0, false, day1)
+	s.AddUsage("traework/m2", 100, 50, 0, 900, 5, 0, false, day1)
 	s.FlushNow()
 
 	// 重启：今日模型 + 今日全局计数（tokens/reqs/exact）恢复

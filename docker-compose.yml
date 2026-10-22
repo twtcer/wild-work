@@ -63,6 +63,8 @@ services:
       WILDWORK_ERR_COOLDOWN: "${WILDWORK_ERR_COOLDOWN:-}"
       # 上游请求超时（秒，非流式；流式不设超时，见 R35）：默认 120
       WILDWORK_TIMEOUT_SECONDS: "${WILDWORK_TIMEOUT_SECONDS:-}"
+      # 思考链死循环检测（R50）：默认开启，写 false 关闭
+      WILDWORK_LOOP_GUARD: "${WILDWORK_LOOP_GUARD:-}"
       # OAuth 回调写进 redirect_uri 的主机（监听固定 0.0.0.0:43903）：默认 127.0.0.1，
       # 从别的机器打开面板登录 traework/qwenwork 时改成面板机器 IP
       WILDWORK_CALLBACK_HOST: "${WILDWORK_CALLBACK_HOST:-}"

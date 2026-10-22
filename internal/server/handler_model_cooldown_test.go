@@ -109,22 +109,21 @@ func Test429ModelCooldownKeepsOtherModelsUsable(t *testing.T) {
 	}
 }
 
-// Test429SecondModelEscalatesAccountCooldown glm 与 deepseek 先后撞墙：
-// 第二次触发整号升级冷却，第三个模型（kimi）的请求得到 503，且文案含解冻时间、
-// 不再误导「需重新登录」。
-func Test429SecondModelEscalatesAccountCooldown(t *testing.T) {
-	h := newRateLimitHandler("glm-5.3", "deepseek-v4.1-flash")
+// Test429ThirdModelEscalatesAccountCooldown glm / deepseek / kimi 先后撞墙：
+// 第三个模型同时冷却才触发整号升级（阈值 2→3，2026-10-20），第四个模型的请求
+// 得到 503，且文案含解冻时间、不再误导「需重新登录」。
+func Test429ThirdModelEscalatesAccountCooldown(t *testing.T) {
+	h := newRateLimitHandler("glm-5.3", "deepseek-v4.1-flash", "kimi-k2.7")
 
-	if rec := doChat(t, h, "qoder/glm-5.3"); rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("glm 首撞应 429: %d", rec.Code)
-	}
-	if rec := doChat(t, h, "qoder/deepseek-v4.1-flash"); rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("deepseek 二撞应 429（透传）: %d", rec.Code)
+	for _, m := range []string{"glm-5.3", "deepseek-v4.1-flash", "kimi-k2.7"} {
+		if rec := doChat(t, h, "qoder/"+m); rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("%s 撞墙应 429（透传）: %d", m, rec.Code)
+		}
 	}
 
-	rec := doChat(t, h, "qoder/kimi-k2.7")
+	rec := doChat(t, h, "qoder/qwen3.8-max")
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("升级整号后第三模型应 503: status=%d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("升级整号后第四模型应 503: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	msg := rec.Body.String()
 	if !strings.Contains(msg, "解冻") {
@@ -136,7 +135,11 @@ func Test429SecondModelEscalatesAccountCooldown(t *testing.T) {
 }
 
 // TestModelAllAccountsCoolingMessageUnfreezeTime 账号健康但请求模型已全池模型级冷却：
-// 503 文案明确「账号均健康、模型限流冷却、最早 HH:MM 解冻、无需重新登录」。
+// 503 文案明确「账号均健康、模型冷却、最早 HH:MM 解冻、无需重新登录」，并带 Retry-After。
+//
+// 措辞不能写死「限流」：同一窗口也可能来自上游排队（ErrQueued 给「号×模型」打 30s），
+// 写「限流」会让用户以为被限速。Retry-After 则让 agent 拿到与首次全号排队（429 +
+// Retry-After: 30）同量级的重试信号，而不是把 503 当「服务坏了」硬退避。
 func TestModelAllAccountsCoolingMessageUnfreezeTime(t *testing.T) {
 	h := newRateLimitHandler("glm-5.3")
 
@@ -149,10 +152,16 @@ func TestModelAllAccountsCoolingMessageUnfreezeTime(t *testing.T) {
 		t.Fatalf("模型级冷却后同模型再请求应 503: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	msg := rec.Body.String()
-	for _, want := range []string{"均健康", "限流冷却", "解冻", "无需重新登录"} {
+	for _, want := range []string{"均健康", "冷却", "解冻", "无需重新登录"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("503 文案应含 %q: %s", want, msg)
 		}
+	}
+	if strings.Contains(msg, "限流冷却") {
+		t.Errorf("文案不应写死「限流」——排队也给同一窗口: %s", msg)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" || ra == "0" {
+		t.Errorf("全模型冷却窗口内应给 Retry-After 重试信号，实际 %q", ra)
 	}
 	if strings.Contains(msg, "refresh token is invalid") {
 		t.Errorf("不应再出现重登误导文案: %s", msg)

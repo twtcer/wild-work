@@ -19,12 +19,12 @@ import (
 
 // kindedUpstream 按 uid 决定返回形态的可配置假上游。
 type kindedUpstream struct {
-	mu     sync.Mutex
-	calls  []string
-	status int                     // 所有账号都返回这个错误形态
-	kind   provider.ErrKind        // Classify 固定返回
-	body   string                  // 错误响应体
-	succeed func(uid string) bool   // 该 uid 返回 200（nil = 全部失败）
+	mu      sync.Mutex
+	calls   []string
+	status  int                   // 所有账号都返回这个错误形态
+	kind    provider.ErrKind      // Classify 固定返回
+	body    string                // 错误响应体
+	succeed func(uid string) bool // 该 uid 返回 200（nil = 全部失败）
 }
 
 func (u *kindedUpstream) RefreshToken(*auth.Auth) error { return nil }
@@ -42,8 +42,10 @@ func (u *kindedUpstream) ChatStream(a *auth.Auth, _ []byte) (io.ReadCloser, int,
 func (u *kindedUpstream) FetchModels(*auth.Auth) ([]provider.ModelInfo, error) {
 	return []provider.ModelInfo{{ID: "m"}}, nil
 }
-func (u *kindedUpstream) FetchModelPricing(*auth.Auth) ([]provider.ModelPricing, error) { return nil, nil }
-func (u *kindedUpstream) UserResource(*auth.Auth) (int64, error)                     { return 0, nil }
+func (u *kindedUpstream) FetchModelPricing(*auth.Auth) ([]provider.ModelPricing, error) {
+	return nil, nil
+}
+func (u *kindedUpstream) UserResource(*auth.Auth) (int64, error) { return 0, nil }
 func (u *kindedUpstream) UserResourceDetail(*auth.Auth) (int64, []provider.ResourceItem, error) {
 	return 0, nil, nil
 }
@@ -69,8 +71,8 @@ func newRotateTestHandler(t *testing.T, up *kindedUpstream, uidPrefix string) *H
 	p.Add(&auth.Auth{Kind: "glm", AccessToken: "at-A", ExpiresAt: 4102444800, UID: uidPrefix + "A"})
 	p.Add(&auth.Auth{Kind: "glm", AccessToken: "at-B", ExpiresAt: 4102444800, UID: uidPrefix + "B"})
 	// A 积分更高保证首挑确定性（pool.PickExcluding 遍历 map 顺序随机）
-	p.SetCreditDetail(uidPrefix+"A", 1000, 0, 0)
-	p.SetCreditDetail(uidPrefix+"B", 500, 0, 0)
+	p.SetCreditDetail(uidPrefix+"A", 1000, 0, 0, time.Time{})
+	p.SetCreditDetail(uidPrefix+"B", 500, 0, 0, time.Time{})
 	return NewHandler(Config{
 		Runtimes: map[provider.Kind]*Runtime{
 			provider.GLM: {Kind: provider.GLM, Pool: p, Upstream: up,
@@ -81,7 +83,6 @@ func newRotateTestHandler(t *testing.T, up *kindedUpstream, uidPrefix string) *H
 		SoftCooldown: 60_000_000_000,
 		ErrThreshold: 3,
 		ErrCooldown:  60_000_000_000,
-		MaxRotate:    3,
 	})
 }
 
@@ -147,7 +148,7 @@ func TestContentErrorDoesNotRotate(t *testing.T) {
 func TestRotatableKindFamilies(t *testing.T) {
 	rotatable := []provider.ErrKind{
 		provider.ErrSoftRate, provider.ErrHardCredit, provider.ErrSessionDead,
-		provider.ErrNotFound, provider.ErrServer, provider.ErrAccountFault, provider.ErrClient,
+		provider.ErrNotFound, provider.ErrAccountFault, provider.ErrClient, provider.ErrQueued,
 	}
 	for _, k := range rotatable {
 		if !k.Rotatable() {
@@ -156,6 +157,9 @@ func TestRotatableKindFamilies(t *testing.T) {
 	}
 	notRotatable := []provider.ErrKind{
 		provider.ErrContentBlocked, provider.ErrPromptTooLong, provider.ErrPassthrough,
+		// 2026-10-20 除名：5xx 实测同一波里 4 个号全 500（workbuddyai 11134），
+		// 且每个号内部客户端已自行重试 3 次 ⇒ 换号必撞同一面墙。
+		provider.ErrServer,
 	}
 	for _, k := range notRotatable {
 		if k.Rotatable() {
@@ -164,8 +168,8 @@ func TestRotatableKindFamilies(t *testing.T) {
 	}
 }
 
-// TestSoftRateResetTs 6004 重置时间解析：命中「将在 <ts> 重置」形态（可带
-// UTC+8 说明后缀）；未命中/非法格式返回 false。
+// TestSoftRateResetTs 6004 重置时间解析：命中中文「将在 <ts> 重置」形态（可带
+// UTC+8 说明后缀）与国际版英文「will reset at <ts>」形态；未命中/非法格式返回 false。
 func TestSoftRateResetTs(t *testing.T) {
 	const withSuffix = `...将在 2026-09-23 14:47:19 UTC+8 重置...`
 	ts, ok := softRateResetTs(withSuffix)
@@ -178,6 +182,16 @@ func TestSoftRateResetTs(t *testing.T) {
 	}
 	if _, ok := softRateResetTs(`...将在 2026-09-23 14:47:19 重置...`); !ok {
 		t.Fatal("不带后缀的形态应命中")
+	}
+	// 国际版 workbuddyai 6004 英文形态
+	const intl = `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at 2026-10-14 12:00:00 UTC+8, alternatively, you can switch to the other models to continue using it."}`
+	ts, ok = softRateResetTs(intl)
+	if !ok {
+		t.Fatal("英文 will reset at 形态应命中")
+	}
+	want = time.Date(2026, 10, 14, 12, 0, 0, 0, time.FixedZone("UTC+8", 8*3600))
+	if !ts.Equal(want) {
+		t.Fatalf("解析时刻 = %v, want %v", ts, want)
 	}
 	for _, miss := range []string{``, `将在`, `将在  重置`, `将在 not-a-time 重置`, `usage exceeds frequency limit`} {
 		if _, ok := softRateResetTs(miss); ok {

@@ -56,31 +56,18 @@ func NewWithTimeout(timeout time.Duration) *Client {
 	return &Client{
 		HTTP:        &http.Client{Timeout: timeout, Transport: tr},
 		StreamHTTP:  &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
-		IdleTimeout: idle.DefaultTimeout,          // 流中空闲监控兜底（见 internal/idle）
+		IdleTimeout: idle.DefaultTimeout,         // 流中空闲监控兜底（见 internal/idle）
 		Base:        OpenAPIBase,
 		Gateway:     GatewayBase,
 	}
 }
 
-// NewWithBase 测试用：覆盖 base/gateway。
-func NewWithBase(base, gateway string) *Client {
-	c := New()
-	c.Base = base
-	c.Gateway = gateway
-	return c
-}
-
-// setModelMap 记录动态模型映射（客户端名 → key）。
-func (c *Client) setModelMap(m map[string]string) {
-	c.modelMu.Lock()
-	c.modelMap = m
-	c.modelMu.Unlock()
-}
-
 // setModelEntries 记录 上游 key → 模型条目 表（与 setModelMap 同批写入）。
-func (c *Client) setModelEntries(entries map[string]DynamicModel) {
+// setModelEntries 同批写入 上游 key→条目表 与 客户端名→key 映射（一把锁，防中间态）。
+func (c *Client) setModelEntries(entries map[string]DynamicModel, nameToKey map[string]string) {
 	c.modelMu.Lock()
 	c.entries = entries
+	c.modelMap = nameToKey
 	c.modelMu.Unlock()
 }
 
@@ -117,18 +104,6 @@ func billingHeaders(req *http.Request, dt string) {
 
 func (c *Client) get(path, dt string) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, c.base()+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	billingHeaders(req, dt)
-	return c.HTTP.Do(req)
-}
-
-func (c *Client) post(path, dt string, body []byte) (*http.Response, error) {
-	if body == nil {
-		body = []byte("{}")
-	}
-	req, err := http.NewRequest(http.MethodPost, c.base()+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -415,8 +390,31 @@ func Classify(status int, body string) provider.ErrKind {
 	if status == http.StatusUnauthorized {
 		return provider.ErrSessionDead
 	}
+	// 排队提示（10605 isQueued）：就算外层是 4xx，语义也是「等一会儿再来」，
+	// 换号可能命中不同队列 ⇒ 独立类别，冷却「号×模型」而不是罚整号。
+	if strings.Contains(body, "10605") || strings.Contains(body, "isQueued") {
+		return provider.ErrQueued
+	}
 	// 429 优先于 hardRule：限流 body 高频带 "quota exceeded"。
 	if status == http.StatusTooManyRequests {
+		return provider.ErrSoftRate
+	}
+	// 账号额度耗尽（qodercom 实测 110「Billing daily count exceeded」/ 112 付费墙）：
+	// 文案不含 hardMarkers 的 "quota exceeded"，必须显式列码，否则会被归成普通
+	// ErrClient 只换号不冷却，下次请求又撞同一堵墙。
+	if strings.Contains(body, `"code":"110"`) || strings.Contains(body, `"code":"112"`) ||
+		strings.Contains(body, `\"code\":\"110\"`) || strings.Contains(body, `\"code\":\"112\"`) ||
+		strings.Contains(body, "pricingUrl") || strings.Contains(body, `"isQuotaExceeded":true`) {
+		return provider.ErrHardCredit
+	}
+	// 上游以 HTTP 200 包裹的排队/限流拒绝：内嵌 403 + subCode:RESOURCE_LIMIT
+	// （业务码 10605，带 retryAfterSeconds/waitTime/serviceAvailable:false）。
+	// 必须排在「403 且 body 为空 → ErrWafBlock」与 4xx 兜底之前，否则落 ErrClient
+	// ——既不罚账号也不进流错误分类（R108）。
+	// 10605 走 provider.CodeMarker 而非裸 Contains：错误文本里的 trace_id/requestId
+	// 常含五位数字，裸匹配会把无关失败误判成限流（与 11115 同一教训）。
+	if strings.Contains(body, "RESOURCE_LIMIT") ||
+		(strings.Contains(body, "serviceAvailable") && provider.CodeMarker(lower, "10605")) {
 		return provider.ErrSoftRate
 	}
 	for _, m := range hardMarkers {
