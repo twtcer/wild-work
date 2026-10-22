@@ -3,6 +3,8 @@ package traework
 import (
 	"encoding/json"
 	"strings"
+
+	"wild-work/internal/sanitize"
 )
 
 // PrepareBody 把 OpenAI chat/completions 请求改写为 Trae SOLO llm_utils_chat 请求。
@@ -92,7 +94,10 @@ func PrepareBody(src []byte, function string) []byte {
 	if err != nil {
 		return src
 	}
-	return out
+	// 末尾挂脱敏（与 workbuddyai 同款，见 wb_utils.go）：剥离上游内容审核黑名单指纹。
+	// 挂在改写之后——此时 content 已是 block 数组，cleanContent 同时兼容 string 与
+	// []any 两种形态；预检不命中原样返回（零分配）。
+	return sanitize.Messages(out)
 }
 
 func normalizeToolChoice(obj map[string]any) {

@@ -47,15 +47,21 @@ func New() *Client {
 
 // NewWithTimeout 指定上游 HTTP 超时；配置连接池。
 func NewWithTimeout(timeout time.Duration) *Client {
+	// ResponseHeaderTimeout 只约束「等响应头」这一段，不碰读 body —— 故与 R35
+	// （StreamHTTP 不设总超时）不冲突。StreamHTTP 无总超时后**必须**有它，否则
+	// 上游连响应头都不回时会无限挂。下限取 180s（与非流式默认总超时同值，不比
+	// 现状更激进），配置调大时跟随放宽（raccoon R118 同款，只放大不压低）。
+	headerTimeout := max(180*time.Second, timeout)
 	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // 强制 HTTP/1.1
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: headerTimeout,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // 强制 HTTP/1.1
 	}
 	return &Client{
 		HTTP:        &http.Client{Timeout: timeout, Transport: tr},
-		StreamHTTP:  &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
+		StreamHTTP:  &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout（R35）
 		IdleTimeout: idle.DefaultTimeout,         // 流中空闲监控兜底（见 internal/idle）
 		Base:        OpenAPIBase,
 		Gateway:     GatewayBase,
