@@ -391,6 +391,7 @@ type RecentCredit struct {
 // Stats 一段时间范围的聚合结果（/api/usage 响应体）。
 type Stats struct {
 	RecordedSince string      `json:"recorded_since,omitempty"` // 首条流水日期 YYYY-MM-DD
+	WindowDays    int         `json:"window_days"`              // 窗口天数（今日=1；全部=首条流水至今）
 	Token         TokenStats  `json:"token"`
 	Credit        CreditStats `json:"credit"`
 }
@@ -427,26 +428,49 @@ type CreditStats struct {
 	NameMap map[string]string `json:"name_map,omitempty"` // uid → 昵称
 }
 
-// Query 聚合最近 days 天的流水（days ∈ {1,7}，其他值按 7 处理）。
-// 读取前自动 Flush。返回结果为新建对象，调用方可直接 JSON 序列化。
+// Query 聚合最近 days 天的流水：days ∈ {1,7,30} 为固定窗口；**0 = 全部历史**（自首条流水起）；
+// 其他值按 7 处理。读取前自动 Flush。返回结果为新建对象，调用方可直接 JSON 序列化。
 // enrich：可选，查询后按 uid 回填账号昵称（闭包由 App 提供，拿 pool 状态）。
 func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string)) *Stats {
-	if days != 1 {
+	all := days == 0
+	if !all && days != 1 && days != 7 && days != 30 {
 		days = 7
 	}
 	l.Flush()
 
 	now := time.Now()
-	from := now.AddDate(0, 0, -(days - 1))
-	fromTs := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, now.Location()).Unix()
-
-	// 覆盖范围内的月份分段（最多 2 个：当月 + 上月）。
-	// 必须按「from 所在月 → now 所在月」逐月枚举：曾用「from 起 +15 天步进」的写法，
-	// 当 from 在上月 25 号之后时（7 天窗口跨月的常态），+15 天直接越过当月导致
-	// 本月分段整月不被扫描——每月 1~6 号面板看不到本月数据（跨年同理）。
+	var from time.Time
+	var fromTs int64
+	// 覆盖范围内的月份分段：固定窗口按「from 所在月 → now 所在月」逐月枚举（曾用
+	// 「from 起 +15 天步进」的写法，from 在上月 25 号后时直接越过当月导致本月
+	// 整月不被扫描，每月 1~6 号面板看不到本月数据，跨年同理）；
+	// 全部模式无窗口可推——直接枚举目录里已有的月份分段文件（文件名即分段键）。
 	months := map[string]bool{}
-	for t := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, now.Location()); !t.After(now); t = t.AddDate(0, 1, 0) {
-		months[t.Format("200601")] = true
+	if all {
+		if ents, err := os.ReadDir(l.dir); err == nil {
+			for _, e := range ents {
+				n := e.Name()
+				for _, prefix := range []string{"usage-", "credit-"} {
+					if strings.HasPrefix(n, prefix) && strings.HasSuffix(n, ".jsonl") {
+						if m := strings.TrimSuffix(strings.TrimPrefix(n, prefix), ".jsonl"); len(m) == 6 {
+							months[m] = true
+						}
+					}
+				}
+			}
+		}
+	} else {
+		from = now.AddDate(0, 0, -(days - 1))
+		fromTs = time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, now.Location()).Unix()
+		for t := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, now.Location()); !t.After(now); t = t.AddDate(0, 1, 0) {
+			months[t.Format("200601")] = true
+		}
+	}
+	// 天桶键格式：固定窗口 ≤30 天不重复，用短键 "01-02"；全部模式可能跨年，
+	// 同月同日两年相撞会把两“天”并成一桶，故用完整日期 "2006-01-02"。
+	dayKey := "01-02"
+	if all {
+		dayKey = "2006-01-02"
 	}
 
 	st := &Stats{}
@@ -476,7 +500,7 @@ func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string))
 						sinceTs = e.Ts
 					}
 					t := time.Unix(e.Ts, 0)
-					key := t.Format("01-02")
+					key := t.Format(dayKey)
 					if e.Ts < fromTs {
 						return // 只影响 recorded_since，不进聚合
 					}
@@ -556,7 +580,7 @@ func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string))
 	// by_day / by_hour 序列化。
 	// **横轴必须是整窗固定刻度**（R98）：只列「有过用量的时段」会让曲线随当前时间
 	// 右端一路收缩（今天 11 点看就只画到 11:00），刻度本身随时刻变化、无法横向比较。
-	// 故一律按窗口全枚举补空桶：days=1 ⇒ 00:00~23:00 共 24 个；days=7 ⇒ 窗口内每天一个。
+	// 故一律按窗口全枚举补空桶：days=1 ⇒ 00:00~23:00 共 24 个；其余 ⇒ 窗口内每天一个。
 	if days == 1 {
 		for h := 0; h < 24; h++ {
 			a := hours[h]
@@ -567,19 +591,39 @@ func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string))
 			st.Token.ByDay = append(st.Token.ByDay, dt)
 		}
 	} else {
+		// 起点：固定窗口 = 窗口首日；全部模式 = 首条流水所在日（usage 优先，
+		// 兼底 credit），一条流水都没有则只给今天一个刻度。
+		start := from
+		if all {
+			base := sinceTs
+			if base == 0 {
+				base = l.earliestCreditTs()
+			}
+			if base > 0 {
+				s := time.Unix(base, 0)
+				start = time.Date(s.Year(), s.Month(), s.Day(), 0, 0, 0, 0, now.Location())
+			} else {
+				start = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			}
+		}
 		// 按日期步进而非 map 遍历：缺数据的日期也要有刻度（否则某天没用量就从横轴上消失）。
 		for i := 0; ; i++ {
-			d := time.Date(from.Year(), from.Month(), from.Day()+i, 0, 0, 0, 0, now.Location())
+			d := time.Date(start.Year(), start.Month(), start.Day()+i, 0, 0, 0, 0, now.Location())
 			if d.After(now) {
 				break
 			}
-			k := d.Format("01-02")
+			k := d.Format(dayKey)
 			dt := DayTokens{Date: k, ByChannel: map[string]int64{}}
 			if a := days_[k]; a != nil {
 				dt.Total, dt.ByChannel = a.total, a.byCh
 			}
 			st.Token.ByDay = append(st.Token.ByDay, dt)
 		}
+	}
+	// 窗口天数：供前端「日均」列除数用（全部模式 = 实际跨度，非固定值）。
+	st.WindowDays = len(st.Token.ByDay)
+	if days == 1 {
+		st.WindowDays = 1
 	}
 
 	// 模型榜降序

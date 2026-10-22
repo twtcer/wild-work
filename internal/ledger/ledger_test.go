@@ -527,3 +527,87 @@ func TestQueryByDayFixedAxis(t *testing.T) {
 		t.Errorf("最后一天=%s want %s（今天）", got, wantLast)
 	}
 }
+
+// TestQuery30Days 30 日窗口：跨月聚合 + 窗口外条目不进统计 + window_days=30。
+func TestQuery30Days(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ledger")
+	l, _ := New(dir)
+	defer l.Close()
+
+	now := time.Now()
+	// 窗口内：20 天前一条（30 日视图应包含它，7 日视图不会）
+	inWin := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location()).AddDate(0, 0, -20)
+	l.AppendUsage(UsageEntry{Ch: "workbuddy", UID: "u1", Model: "glm-5.2", PT: 100, CT: 50, Ts: inWin.Unix()})
+	// 窗口外：40 天前一条
+	outWin := inWin.AddDate(0, 0, -20)
+	l.AppendUsage(UsageEntry{Ch: "workbuddy", UID: "u1", Model: "glm-5.2", PT: 7, CT: 3, Ts: outWin.Unix()})
+
+	st := l.Query(30, nil)
+	if st.Token.Total != 150 {
+		t.Fatalf("30 日窗口 total=%d want 150（窗口外条目不得混入）", st.Token.Total)
+	}
+	if st.WindowDays != 30 {
+		t.Fatalf("window_days=%d want 30", st.WindowDays)
+	}
+	// 30 日窗口逐日补空桶：含今天共 30 个刻度
+	if len(st.Token.ByDay) != 30 {
+		t.Fatalf("by_day len=%d want 30", len(st.Token.ByDay))
+	}
+
+	// 对照：7 日窗口看不到 20 天前那条
+	if got := l.Query(7, nil).Token.Total; got != 0 {
+		t.Fatalf("7 日窗口 total=%d want 0（20 天前条目应在窗口外）", got)
+	}
+}
+
+// TestQueryAllHistory days=0（全部）：自首条流水起聚合、跨年天桶用完整日期不相撞、
+// window_days = 实际跨度（供前端「日均」除数）。
+func TestQueryAllHistory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ledger")
+	l, _ := New(dir)
+	defer l.Close()
+
+	now := time.Now()
+	// 今天一条 + 100 天前一条（7/30 日窗口都看不到）
+	today := time.Date(now.Year(), now.Month(), now.Day(), 9, 0, 0, 0, now.Location())
+	old := today.AddDate(0, 0, -100)
+	l.AppendUsage(UsageEntry{Ch: "workbuddy", UID: "u1", Model: "m", PT: 10, CT: 5, Ts: today.Unix()})
+	l.AppendUsage(UsageEntry{Ch: "traework", UID: "u2", Model: "d", PT: 200, CT: 100, Ts: old.Unix()})
+
+	st := l.Query(0, nil)
+	if st.Token.Total != 315 {
+		t.Fatalf("全部模式 total=%d want 315（100 天前条目必须进统计）", st.Token.Total)
+	}
+	if st.Token.Requests != 2 {
+		t.Fatalf("requests=%d want 2", st.Token.Requests)
+	}
+	// 跨度 = 101 天（含首尾）
+	if st.WindowDays != 101 {
+		t.Fatalf("window_days=%d want 101", st.WindowDays)
+	}
+	if len(st.Token.ByDay) != 101 {
+		t.Fatalf("by_day len=%d want 101", len(st.Token.ByDay))
+	}
+	// 天桶键必须是完整日期（"2026-07-14" 形态）——MM-DD 短键跨年会把两年同月
+	// 同日并成一桶（本测试两条恰好不同日，这里锁键格式本身）
+	first := st.Token.ByDay[0].Date
+	if len(first) != 10 || first[4] != '-' || first[7] != '-' {
+		t.Fatalf("全部模式天桶键应为 YYYY-MM-DD，got %q", first)
+	}
+	// 100 天前那条落在首桶
+	if st.Token.ByDay[0].Total != 300 {
+		t.Fatalf("首桶 total=%d want 300（最早条目应落首日桶）", st.Token.ByDay[0].Total)
+	}
+}
+
+// TestQueryInvalidDaysFallback 其他值仍按 7 处理（非 1/7/30/0 的入参不得误开全量扫描）。
+func TestQueryInvalidDaysFallback(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ledger")
+	l, _ := New(dir)
+	defer l.Close()
+
+	l.AppendUsage(UsageEntry{Ch: "workbuddy", UID: "u1", Model: "m", PT: 1, CT: 1})
+	if got := l.Query(5, nil).WindowDays; got != 7 {
+		t.Fatalf("Query(5) window_days=%d want 7（非法值落默认 7 日窗口）", got)
+	}
+}

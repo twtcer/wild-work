@@ -3786,15 +3786,17 @@ function bind() {
 }
 
 // ---------- 用量与流水面板（变量声明必须在 init 执行前——bindUsage() 在 init 顶部调用） ----------
-// usageDays 从 localStorage 恢复上次选择（今日/7日），刷新页面不重置回 7 日。
+// usageDays 从 localStorage 恢复上次选择（今日/7日/30日/全部），刷新页面不重置回 7 日。
+// 0 = 全部历史（后端 ledger.Query(days=0) 自首条流水起聚合）。
 // 存储键与 TOAST_SEEN_KEY 同族（usage-range-seen）；非法值回退默认 7。
 // ⚠️ 本段必须在 init() 之前执行：bindUsage() 在 init 顶部被调用并引用 usageDays，
 //    若声明滞后于 init（IIFE 立即执行），let 处于暂时性死区（TDZ）会抛
 //    ReferenceError 中断整个 init —— 实测表现：账号卡片/费率表全空白、
 //    控制台报 "Cannot access 'usageDays' before initialization"。
 const USAGE_DAYS_KEY = "usage-range-seen";
-const USAGE_DAYS_VALID = [1, 7];
+const USAGE_DAYS_VALID = [1, 7, 30, 0];
 let usageDays = 7;
+let usageSince = "";  // 后端 recorded_since（首条流水日期），「全部」视图横轴起点
 try {
   const v = parseInt(localStorage.getItem(USAGE_DAYS_KEY) || "", 10);
   if (USAGE_DAYS_VALID.includes(v)) usageDays = v;
@@ -3891,6 +3893,7 @@ async function loadUsage() {
 }
 
 function renderUsage(st) {
+  usageSince = st.recorded_since || ""; // 「全部」视图横轴起点（积分图建刻度用）
   $("ucTokens").textContent = fmtTokensFull(st.token.total);
   $("ucReqs").textContent = fmtCredits(st.token.requests);
   $("ucSpend").textContent = fmtCredits(st.credit.spend);
@@ -3898,13 +3901,13 @@ function renderUsage(st) {
   renderUsageCacheCard(st.token || {});
   syncUsageRangeActive(); // 高亮始终跟随 usageDays（含异步返回路径）
 
-  renderModelTable(st.token.by_model || [], usageDays);
+  renderModelTable(st.token.by_model || [], st.window_days || usageDays);
   renderCreditTab(st.credit || {});
   renderUsageChart(st);
   renderCreditChart(st.credit || {});
 }
 
-// syncUsageRangeActive 把「今日/7日」按钮高亮同步为当前 usageDays。
+// syncUsageRangeActive 把「今日/7日/30日/全部」按钮高亮同步为当前 usageDays。
 // 单一入口：初始化、点击切换、异步返回都走它，避免三处 toggle 竞态
 // （此前点击后 loadUsage 异步返回时高亮被回写错误的 bug）。
 function syncUsageRangeActive() {
@@ -4030,7 +4033,7 @@ function renderCreditChart(entries, names) {
   if (!creditChart) return;
   // 按日（今日视图按小时）× 账号聚合
   const dates = usageAxisKeys(usageDays); // 固定整窗刻度，不是「只有消耗的时段」
-  const keyOf = (ts) => (usageDays === 1 ? fmtHour(ts) : fmtDay(ts));
+  const keyOf = (ts) => (usageDays === 1 ? fmtHour(ts) : usageDays === 0 ? fmtDayFull(ts) : fmtDay(ts));
   const byAcct = {}; // uid -> {date: spend}
   const totals = {}; // uid -> 总消耗
   for (const e of spends) {
@@ -4092,6 +4095,13 @@ function fmtDay(ts) {
   return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+// fmtDayFull 时间戳 → "2026-09-21"（「全部」视图跨年，短键 MM-DD 会相撞，
+// 与后端 ledger.Query 全部模式的天桶键同形）
+function fmtDayFull(ts) {
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 // fmtHour 时间戳 → "09:00"（今日视图的小时桶键，与后端 by_day 的 date 同形）
 function fmtHour(ts) {
   const d = new Date(ts * 1000);
@@ -4099,7 +4109,8 @@ function fmtHour(ts) {
 }
 
 // usageAxisKeys 固定横轴刻度（R98）：
-//   days=1 ⇒ 当天 00:00~23:00 共 24 个小时桶；days>1 ⇒ 窗口内每天（含今天）。
+//   days=1 ⇒ 当天 00:00~23:00 共 24 个小时桶；days=0（全部）⇒ recorded_since 起每天（完整日期键）；
+//   其余 ⇒ 窗口内每天（含今天）。
 // **刻度只跟区间有关，与「当前几点」无关**——后端 ledger.Query 已按同一口径补齐空桶，
 // 这里算一份是为了让积分图（自己按流水聚合，不走 by_day）跟 token 图刻度完全对齐。
 function usageAxisKeys(days) {
@@ -4107,6 +4118,20 @@ function usageAxisKeys(days) {
   const out = [];
   if (days === 1) {
     for (let h = 0; h < 24; h++) out.push(`${String(h).padStart(2, "0")}:00`);
+    return out;
+  }
+  if (days === 0) {
+    // 全部：起点 = 后端 recorded_since（首条流水日期）；缺失则退化为仅今天
+    let start = now;
+    if (usageSince) {
+      const p = usageSince.split("-").map(Number); // [YYYY, MM, DD]
+      if (p.length === 3 && p.every((n) => Number.isFinite(n))) {
+        start = new Date(p[0], p[1] - 1, p[2]);
+      }
+    }
+    for (let d = new Date(start); d <= now; d.setDate(d.getDate() + 1)) {
+      out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`);
+    }
     return out;
   }
   for (let i = days - 1; i >= 0; i--) {

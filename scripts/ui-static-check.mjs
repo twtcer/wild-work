@@ -1333,8 +1333,8 @@ for (const [label, re] of uniq) {
     /const dates = usageAxisKeys\(usageDays\)/.test(creditBody), creditBody.slice(0, 300));
   check45("积分图不再用「只含有消耗的时段」建横轴",
     !/new Set\(spends\.map\(\(e\) => fmtDay\(e\.ts\)\)\)/.test(creditBody));
-  check45("积分图今日视图按小时归桶（fmtHour）",
-    /usageDays === 1 \? fmtHour\(ts\) : fmtDay\(ts\)/.test(creditBody));
+  check45("积分图今日视图按小时归桶（fmtHour）；全部视图按完整日期归桶（跨年不撞）",
+    /usageDays === 1 \? fmtHour\(ts\) : usageDays === 0 \? fmtDayFull\(ts\) : fmtDay\(ts\)/.test(creditBody));
 
   for (const [label, pass, extra] of need45) {
     console.log(`  ${pass ? "✅" : "❌"} ${label}${!pass && extra ? `  ← ${extra}` : ""}`);
