@@ -28,6 +28,7 @@ docs/*
 !docs/模型降级链定义.md
 !docs/全渠道登录授权方式梳理.md
 !docs/渠道配色规范.md
+!docs/渠道识别变更参考.md
 
 # 临时文件
 temp/
