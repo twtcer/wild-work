@@ -96,7 +96,11 @@ type PlatformRow struct {
 	CreditOut     int64  `json:"credit_out"`
 	CreditExpired int64  `json:"credit_expired"`
 	CreditUsed    int64  `json:"credit_used"`
-	Tokens        int64  `json:"tokens"`
+	// CreditCloud 云端权威今日消耗（目前仅 officeace 上报；无云端源的渠道为 0）。
+	// 与 CreditUsed 是**两套并列口径**（R43）：CreditUsed 为本地差值推算、
+	// CreditCloud 为上游按日消耗端点给出的权威值。两者天然可能不同，不互校。
+	CreditCloud int64 `json:"credit_cloud,omitempty"`
+	Tokens      int64 `json:"tokens"`
 	// 三个到期列（2026-10-19 重构口径）：按**精确时刻**判定，边界是**自然日**，
 	// 且**次日 00:00:00 失效算今日**（上游每日类额度的真实形态）。
 	// 逐条目累加，不再只取「每账号最早到期日」——旧口径会把
@@ -286,6 +290,12 @@ type Stats struct {
 	expiredByGroup map[string]int64
 	expiredTotal   int64
 
+	// 云端权威今日消耗（officeace 云端「按日消耗」端点周期喂入，纯内存不落盘）。
+	// **与差值口径 (creditOut/creditExpired) 并列，不互相覆盖**（R43）：差值是推算、
+	// 可能漏记（条目晚建/包到期），云端是上游权威值。面板以「云端」标注展示，
+	// 两套数天然可能不同，不追求对齐。
+	cloudSpendByGroup map[string]int64
+
 	tokenDays map[string]int64                  // YYYY-MM-DD -> tokens（不含今日）
 	reqDays   map[string]int64                  // YYYY-MM-DD -> reqs（不含今日）
 	modelDays map[string]map[string]*modelEntry // 历史日 -> 模型 -> 消耗（跨天归档）
@@ -314,19 +324,20 @@ func New(dataDir string, logf func(format string, args ...any)) (*Stats, error) 
 		logf = func(string, ...any) {}
 	}
 	s := &Stats{
-		dir:            dataDir,
-		file:           filepath.Join(dataDir, "stats.json"),
-		today:          todayKey(time.Now()),
-		accts:          map[string]*acct{},
-		sticky:         map[string]stickyInfo{},
-		events:         map[string]int64{},
-		expiredByGroup: map[string]int64{},
-		tokenDays:      map[string]int64{},
-		reqDays:        map[string]int64{},
-		modelDays:      map[string]map[string]*modelEntry{},
-		models:         map[string]*modelEntry{},
-		ring:           make([]ReqRow, 0, ringCap),
-		logf:           logf,
+		dir:               dataDir,
+		file:              filepath.Join(dataDir, "stats.json"),
+		today:             todayKey(time.Now()),
+		accts:             map[string]*acct{},
+		sticky:            map[string]stickyInfo{},
+		events:            map[string]int64{},
+		expiredByGroup:    map[string]int64{},
+		cloudSpendByGroup: map[string]int64{},
+		tokenDays:         map[string]int64{},
+		reqDays:           map[string]int64{},
+		modelDays:         map[string]map[string]*modelEntry{},
+		models:            map[string]*modelEntry{},
+		ring:              make([]ReqRow, 0, ringCap),
+		logf:              logf,
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -364,6 +375,7 @@ func (s *Stats) rollDayLocked(now time.Time) {
 	s.tokensToday, s.reqsToday = 0, 0
 	s.expiredByGroup = map[string]int64{}
 	s.expiredTotal = 0
+	s.cloudSpendByGroup = map[string]int64{}
 	s.models = map[string]*modelEntry{}
 	s.milestone = 0
 	s.events = map[string]int64{} // 签到事件收入：跨天作废（重扫日志自动重建）
@@ -516,6 +528,39 @@ func (s *Stats) ApplyLedgerExpire(day string, byGroup map[string]int64) {
 	}
 	s.expiredByGroup = grouped
 	s.expiredTotal = total
+}
+
+// ApplyCloudSpend 写入一轮「云端权威今日消耗」（officeace 云端按日消耗端点喂入）。
+//
+// 与 ApplyLedgerExpire 同款纪律：byGroup 是本轮**全量**（整体替换，非累加）；
+// 拉取失败时调用方**不应调用**本方法，保留上一轮有效值。
+// day 守卫：归属日须等于当前记账日（云端 created_at 已按北京时间换算），
+// 否则整批丢弃——跨零点时上游可能仍回昨日数据。
+//
+// **不覆盖差值口径**（R43）：云端值是上游权威数，差值是本工具推算数，
+// 两者天然可能不同，并列展示、不互相校正。
+func (s *Stats) ApplyCloudSpend(day string, byGroup map[string]int64) {
+	if day == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rollDayLocked(time.Now())
+	if day != s.today {
+		return
+	}
+	grouped := make(map[string]int64, len(byGroup))
+	for ch, v := range byGroup {
+		if v <= 0 {
+			continue
+		}
+		name := normalizePlatform(ch)
+		if name == "" {
+			name = "unknown"
+		}
+		grouped[name] += v
+	}
+	s.cloudSpendByGroup = grouped
 }
 
 // ApplySticky 写入平台当前粘性账号（server 粘性路由访问器喂入，纯内存、每轮覆盖）。
@@ -806,6 +851,10 @@ func (s *Stats) platformRowsLocked(now time.Time) []PlatformRow {
 	for g, v := range s.expiredByGroup {
 		rowOf(g).CreditExpired += v
 	}
+	// 云端权威今日消耗（officeace 云端按日消耗喂入；与差值口径并列不覆盖）
+	for g, v := range s.cloudSpendByGroup {
+		rowOf(g).CreditCloud += v
+	}
 	// 净值 = 差值花费 − 今日作废，钳 0：两源刷新窗口不同、差值口径本身滞后，
 	// 短暂倒挂时显示 0 而不是负的「今日消耗」。
 	for _, r := range agg {
@@ -817,6 +866,7 @@ func (s *Stats) platformRowsLocked(now time.Time) []PlatformRow {
 	out := make([]PlatformRow, 0, len(agg))
 	for _, r := range agg {
 		if r.Credits <= 0 && r.CreditIn <= 0 && r.CreditOut <= 0 && r.CreditExpired <= 0 &&
+			r.CreditCloud <= 0 &&
 			r.Tokens <= 0 && r.Expire7d <= 0 && r.ExpireToday <= 0 && r.ExpireTomorrow <= 0 {
 			continue
 		}
@@ -1024,17 +1074,16 @@ func (s *Stats) Snapshot(now time.Time) Snapshot {
 	copy(toasts, s.toasts)
 
 	return Snapshot{
-		Version:         Version,
-		Today:           s.today,
-		Now:             now.Format("2006-01-02 15:04:05"),
-		TotalCredits:    totalCredits,
-		TotalAccounts:   len(s.accts),
-		CreditIn:        s.creditInTotal,
-		CreditOut:       s.creditOutTotal,
-		CreditOutExact:  s.creditOutExact,
-		CreditExpired:   s.expiredTotal,
-		CreditUsed:      creditUsed,
-		Tokens:          s.tokensToday,
+		Version:        Version,
+		Today:          s.today,
+		Now:            now.Format("2006-01-02 15:04:05"),
+		TotalCredits:   totalCredits,
+		TotalAccounts:  len(s.accts),
+		CreditIn:       s.creditInTotal,
+		CreditOut:      s.creditOutTotal,
+		CreditOutExact: s.creditOutExact,
+		CreditExpired:  s.expiredTotal,
+		CreditUsed:     creditUsed, Tokens: s.tokensToday,
 		Reqs:            s.reqsToday,
 		TokenUsage:      tu,
 		Expiring7d:      expiring7d,

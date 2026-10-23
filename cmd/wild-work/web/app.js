@@ -4347,7 +4347,7 @@ function renderPlatformTable(s) {
       `<span class="st-plat-accts">${fmtCredits(r.accounts)}</span>` +
       stPlatNum("st-plat-credits", r.credits, "分") +
       stPlatNum("st-plat-in", r.credit_in) +
-      stPlatNum("st-plat-out", r.credit_used) +
+      stPlatCloudCell(r) +
       stPlatNum("st-plat-expd", r.credit_expired) +
       stPlatTok(r.tokens) +
       stPlatNum("st-plat-exp", r.expire_today, "分") +
@@ -4419,6 +4419,22 @@ function stPlatNum(cls, amount, suffix) {
   amount = Number(amount) || 0;
   if (amount <= 0) return `<span class="${cls} st-plat-zero">—</span>`;
   return `<span class="${cls}">${fmtCredits(amount)}${suffix || ""}</span>`;
+}
+
+// stPlatCloudCell 平台表「今日消耗」单元格：以差值口径为主，云端权威值只做悬浮说明。
+//
+// 为什么不新增一列：平台表列宽是 fitPlatCols 逐个实测内容宽后经 --plat-cols 写入的，
+// 加列要同步改静态兜底模板与窄屏断点，且窄屏本就要横向滚动（R98 同源顾虑）。
+// 以 title 附加的收益已足够：用户能看到「本工具算的」与「上游报的」两个数，
+// 差异一目了然（R43：两套口径不互校，也不追求对齐）。
+function stPlatCloudCell(r) {
+  const used = Number(r.credit_used) || 0;
+  const cloud = Number(r.credit_cloud) || 0;
+  if (cloud <= 0) return stPlatNum("st-plat-out", used);
+  const tip = `差值口径 ${fmtCredits(used)}（本工具推算，含未入账漏记）；` +
+    `云端权威 ${fmtCredits(cloud)}（上游按日消耗端点）。两套口径并列不互校。`;
+  const label = used > 0 ? fmtCredits(used) : "—";
+  return `<span class="st-plat-out" title="${esc(tip)}">${label}<span class="st-plat-sub">≈</span></span>`;
 }
 // Token 单元格：单位走 万/亿，0 同样置灰
 function stPlatTok(amount) {

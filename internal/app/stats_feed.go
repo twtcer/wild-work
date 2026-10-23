@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"wild-work/internal/officeace"
 	"wild-work/internal/provider"
 	statsEngine "wild-work/internal/stats"
 )
@@ -48,6 +49,7 @@ func (a *App) StartStatsFeeders(ctx context.Context) {
 				}
 			}
 			a.feedLedgerExpire(now)
+			a.feedCloudSpend(now)
 		}
 		feed() // 启动即喂：面板打开即有数（差值首轮只建基线，消耗从第二轮起记）
 		t := time.NewTicker(StatsFeedInterval)
@@ -136,4 +138,54 @@ func expiryItems(items []provider.ResourceItem) []statsEngine.ExpireItem {
 		out = append(out, statsEngine.ExpireItem{At: it.ExpireAt, Amount: it.Remain})
 	}
 	return out
+}
+
+// feedCloudSpend 把「云端权威今日消耗」喂给统计引擎（目前仅 officeace 有该端点）。
+//
+// 与 feedLedgerExpire 的分工：后者是**本地差值推算**（可能漏记），本喂入器是
+// **上游权威值**。两者并列展示、不互相覆盖（R43：两套口径不互校）。
+//
+// 失败纪律（同 ledger 作废额）：**任一账号拉取失败即整轮放弃**，保留引擎上一轮
+// 有效值——把失败当 0 会让面板「今日消耗」无故归零，比显示陈旧值更误导。
+// 单帐号失败不阻塞其它渠道：只放弃本轮 officeace 部分。
+//
+// 超时隔离：在 ticker goroutine 内同步调用，若上游慢会拖住整个 feed 周期。
+// 故只取「第一个健康账号」当天数据（云端按帐号计、同帐号共享额度，
+// 多账号时按账号逐条累加才是真实全池消耗——此处遍历全部可用账号）。
+func (a *App) feedCloudSpend(now time.Time) {
+	if a.stats == nil {
+		return
+	}
+	rt := a.runtime(provider.OfficeAce)
+	if rt == nil || rt.Pool == nil {
+		return
+	}
+	cli, ok := rt.Upstream.(*officeace.Client)
+	if !ok || cli == nil {
+		return
+	}
+	day := now.Format("2006-01-02")
+	byGroup := map[string]int64{}
+	for _, st := range rt.Pool.List() {
+		if st.Disabled || st.SessionDead {
+			continue
+		}
+		au := rt.Pool.AuthByUID(st.UID)
+		if au == nil {
+			continue
+		}
+		b, err := cli.SubscriptionUsageToday(au)
+		if err != nil {
+			// 静默降级：保留上一轮值（见上方失败纪律）。不写日志——
+			// 该喂入器每 30s 一轮，上游长期 4xx 时会刷屏。
+			return
+		}
+		// 云端消耗是 float（积分可带小数），引擎口径是 int64：四舍五入到整数分。
+		pts := b.Points
+		if pts < 0 {
+			pts = 0
+		}
+		byGroup[rt.Kind.String()] += int64(pts + 0.5)
+	}
+	a.stats.ApplyCloudSpend(day, byGroup)
 }

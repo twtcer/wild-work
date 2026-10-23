@@ -2,6 +2,13 @@ name: Docker Image
 
 # 发版 tag（v*）构建 linux/amd64 + arm64 镜像推 GHCR；也可手动触发（dev 标签）。
 # 与 build.yml（五平台二进制 release）相互独立：本工作流失败不阻塞二进制发版。
+#
+# **阿里云 ACR（可选，fork 新增）**：配置以下 secrets 后自动同时推 ACR，未配置则
+# 整段跳过、不影响 GHCR：ACR_REGISTRY / ACR_USERNAME / ACR_PASSWORD（必需）、
+# ACR_REPOSITORY（可选，如 landwind/wild-work，默认即此值）。
+# ⚠️ ACR 不认 BuildKit 默认的 provenance/SBOM attestation 清单（oci.empty.v1+json），
+# 推送会报 `unknown manifest class` —— 故 ACR 那条构建必须 --provenance=false --sbom=false，
+# 与 scripts/docker-build-push.sh 的本地脚本同口径。
 on:
   push:
     tags:
@@ -54,3 +61,42 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ---- 阿里云 ACR（可选）----
+      # 未配 secrets 时 enabled=false，后续两步整体跳过（GHCR 已推完，不受影响）。
+      - name: Check ACR secrets
+        id: acr
+        run: |
+          if [ -n "${{ secrets.ACR_REGISTRY }}" ] && [ -n "${{ secrets.ACR_USERNAME }}" ] && [ -n "${{ secrets.ACR_PASSWORD }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 ACR_REGISTRY/ACR_USERNAME/ACR_PASSWORD，跳过阿里云 ACR 推送"
+          fi
+
+      - uses: docker/login-action@v3
+        if: steps.acr.outputs.enabled == 'true'
+        with:
+          registry: ${{ secrets.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # 额外一次构建推 ACR：registry 不同不能复用上面的 tags，但可复用同一份 gha
+      # 缓存 ⇒ 只是多一次 manifest 导出，几乎不耗时。
+      # --provenance=false --sbom=false 是 ACR 硬要求（见文件头注释）。
+      - uses: docker/build-push-action@v6
+        if: steps.acr.outputs.enabled == 'true'
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_REPOSITORY || 'landwind/wild-work' }}:${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+            ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_REPOSITORY || 'landwind/wild-work' }}:latest
+          cache-from: type=gha
+
+      - name: ACR pushed
+        if: steps.acr.outputs.enabled == 'true'
+        run: echo "✅ 已推送 ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_REPOSITORY || 'landwind/wild-work' }}"

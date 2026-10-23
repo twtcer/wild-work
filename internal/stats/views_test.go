@@ -571,3 +571,100 @@ func TestRotationFollowsEarliestExpire(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyCloudSpendParallelToLedger 云端权威消耗与差值口径**并列不互相覆盖**（R43）。
+// 这是本功能的核心契约：接上云端值后，CreditUsed（本地推算）必须原样保留，
+// 两者各自独立可查，谁也不能拿对方的数校正自己。
+//
+// 变异验证（2026-10-23 实测）：把 `rowOf(g).CreditCloud += v` 改成 `CreditOut += v`
+// 本测试当场变红（CreditCloud=0）——这正是要防的「云端值污染差值口径」。
+// 注：`CreditUsed` 在平台行汇总末尾由 `CreditOut - CreditExpired` **重算**，
+// 故「写 CreditUsed」的变异不会变红（结构上无害）；真正需要锁的是 CreditOut 不被污染。
+func TestApplyCloudSpendParallelToLedger(t *testing.T) {
+	s := newTestStats(t)
+	now := time.Now()
+	day := todayKey(now)
+
+	// 造一个「差值口径」的消耗：喂两次账号快照产生 creditOut 下降
+	feedAcct := func(credits int64) {
+		s.ApplyPoll([]Account{{
+			UID: "u1", Group: "officeace", Nickname: "a", Credits: credits,
+		}}, now)
+	}
+	feedAcct(1000)
+	feedAcct(900) // 差值消耗 100
+
+	before := s.Snapshot(now)
+	if before.CreditOut != 100 {
+		t.Fatalf("前置：差值消耗应为 100，实际 %d", before.CreditOut)
+	}
+
+	// 喂入云端权威值 137（与差值 100 不同，模拟上游真实消耗）
+	s.ApplyCloudSpend(day, map[string]int64{"officeace": 137})
+
+	after := s.Snapshot(now)
+	// 差值口径不得被云端值覆盖
+	if after.CreditOut != 100 {
+		t.Fatalf("云端值覆盖了差值口径：CreditOut = %d, want 100", after.CreditOut)
+	}
+	var row *PlatformRow
+	for i := range after.Platforms {
+		if after.Platforms[i].Group == "officeace" {
+			row = &after.Platforms[i]
+		}
+	}
+	if row == nil {
+		t.Fatal("officeace 平台行缺失")
+	}
+	if row.CreditCloud != 137 {
+		t.Fatalf("云端值未落到平台行：CreditCloud = %d, want 137", row.CreditCloud)
+	}
+	if row.CreditUsed != 100 {
+		t.Fatalf("平台行净值仍应是差值口径：CreditUsed = %d, want 100", row.CreditUsed)
+	}
+}
+
+// TestApplyCloudSpendReplaceSemantics 与 ApplyLedgerExpire 同款：全量替换、非累加。
+func TestApplyCloudSpendReplaceSemantics(t *testing.T) {
+	s := newTestStats(t)
+	now := time.Now()
+	day := todayKey(now)
+
+	s.ApplyCloudSpend(day, map[string]int64{"officeace": 200})
+	s.ApplyCloudSpend(day, map[string]int64{"officeace": 50}) // 全量替换
+	var got int64
+	for _, r := range s.Snapshot(now).Platforms {
+		if r.Group == "officeace" {
+			got = r.CreditCloud
+		}
+	}
+	if got != 50 {
+		t.Fatalf("应为全量替换为 50，实际 %d（累加会得 250）", got)
+	}
+}
+
+// TestApplyCloudSpendDayGuard 空 day / 非今日 day 不得污染当日数值。
+func TestApplyCloudSpendDayGuard(t *testing.T) {
+	s := newTestStats(t)
+	now := time.Now()
+	day := todayKey(now)
+	s.ApplyCloudSpend(day, map[string]int64{"officeace": 100})
+
+	read := func() int64 {
+		for _, r := range s.Snapshot(now).Platforms {
+			if r.Group == "officeace" {
+				return r.CreditCloud
+			}
+		}
+		return 0
+	}
+
+	s.ApplyCloudSpend("", map[string]int64{"officeace": 999})
+	if got := read(); got != 100 {
+		t.Fatalf("空 day 不应覆盖：%d, want 100", got)
+	}
+	s.ApplyCloudSpend(todayKey(now.Add(-24*time.Hour)), map[string]int64{"officeace": 888})
+	if got := read(); got != 100 {
+		t.Fatalf("昨日 day 应整批丢弃：%d, want 100", got)
+	}
+}
