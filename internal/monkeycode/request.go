@@ -310,6 +310,12 @@ func assistantBlocks(m map[string]any) []any {
 
 // toolResultBlocks 把 OpenAI 的 role=tool 消息转成 Anthropic 的 tool_result 块
 // （Anthropic 里 tool_result 属于 user 消息）。
+//
+// content 形态：Anthropic 的 tool_result.content 接受 string 或**块数组**
+// （text / image 混合）。故工具结果里的图片必须转成 image 块一并带过去，
+// 不能只拼文本——否则 Codex `view_image` 之类的工具结果到上游就成了「空结果」，
+// 模型看不到图（R113 图片两维陷阱的字节维之外，这里是**可见性**缺口）。
+// 图片块复用 imageBlock（与消息体同一条转换，支持 data: 与 http(s)）。
 func toolResultBlocks(m map[string]any) []any {
 	id, _ := m["tool_call_id"].(string)
 	if id == "" {
@@ -318,25 +324,48 @@ func toolResultBlocks(m map[string]any) []any {
 	if id == "" {
 		id = "call_unknown"
 	}
-	text := ""
-	switch v := m["content"].(type) {
-	case string:
-		text = v
-	case []any:
-		var sb strings.Builder
-		for _, b := range v {
-			if bm, ok := b.(map[string]any); ok {
-				if t, ok := bm["text"].(string); ok {
-					sb.WriteString(t)
+
+	var text strings.Builder
+	var imgs []any
+	for _, b := range contentBlocks(m["content"]) {
+		switch v := b.(type) {
+		case string:
+			text.WriteString(v)
+		case map[string]any:
+			switch v["type"] {
+			case "text":
+				if s, ok := v["text"].(string); ok {
+					text.WriteString(s)
+				}
+			case "image_url", "image", "input_image":
+				if img := imageBlock(v); img != nil {
+					imgs = append(imgs, img)
 				}
 			}
 		}
-		text = sb.String()
 	}
+
+	// 无图片：保持 string（与原行为逐字一致，不给上游多余结构）
+	if len(imgs) == 0 {
+		return []any{map[string]any{
+			"type":        "tool_result",
+			"tool_use_id": id,
+			"content":     text.String(),
+		}}
+	}
+	// 有图片：content 改块数组（text 在前、图片在后，与 zcode/minimax 同序）
+	arr := make([]any, 0, len(imgs)+1)
+	if text.Len() > 0 {
+		arr = append(arr, map[string]any{"type": "text", "text": text.String()})
+	} else {
+		// 纯图片结果：补一条文本占位，避免上游把「只有图片」判成空 content
+		arr = append(arr, map[string]any{"type": "text", "text": "[image]"})
+	}
+	arr = append(arr, imgs...)
 	return []any{map[string]any{
 		"type":        "tool_result",
 		"tool_use_id": id,
-		"content":     text,
+		"content":     arr,
 	}}
 }
 

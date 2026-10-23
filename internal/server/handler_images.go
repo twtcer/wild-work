@@ -314,10 +314,12 @@ func (h *Handler) runGLM(w http.ResponseWriter, r *http.Request, model string, c
 	res, err := call(rt.Upstream, acct)
 	if err == nil {
 		rt.Pool.NoteSuccess(acct.UID)
-		h.stickySuccess(rt)
+		// GLM 图片路径与具体模型无关（走 images 端点），传空 model 走渠道级粘性
+		h.stickySuccess(rt, "")
 		return res, nil
 	}
-	h.stickyClear(rt)
+	// 同上：无 model 概念，清除该渠道下所有模型的粘性记录
+	h.stickyClear(rt, "")
 	var pe *provider.Error
 	if errors.As(err, &pe) {
 		switch pe.Kind {

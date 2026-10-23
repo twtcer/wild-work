@@ -222,8 +222,22 @@ func NewHandler(cfg Config) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
 
-// stickyKey 粘性路由 key（按渠道独立）
-func (h *Handler) stickyKey(kind provider.Kind) string { return kind.String() }
+// stickyKey 粘性路由 key：渠道 + 模型（R29 修订）。
+//
+// 为何升到 model 维度（2026-10-23）：原 key 只有渠道名，同一个渠道内换模型
+// 仍会粘在「上次为另一个模型选中的账号」上。后果是：账号 A 在模型 X 上涨饱和/
+// 模型级冷却后，请求模型 Y 时粘性路由仍把 A 推上去（虽被 modelCooled 拦住，
+// 但拦住后走 PickForModel 重选又立刻覆写粘性记录）—— 多模型混用场景下
+// 粘性路由实际不生效，频繁无意义换号。
+//
+// model 为空串 ⇒ 退化为渠道级（GLM images 等与具体模型无关的路径用）；
+// 这样兼容旧调用点语义，不需为它们额外传 model。
+func (h *Handler) stickyKey(kind provider.Kind, model string) string {
+	if model == "" {
+		return kind.String()
+	}
+	return kind.String() + "/" + model
+}
 
 // pickWithSticky 粘性路由选择账号。
 // 优先使用上次成功路由的账号，直到：
@@ -235,7 +249,7 @@ func (h *Handler) pickWithSticky(rt *Runtime, model string) *auth.Auth {
 	const defaultMaxReqs = 50
 
 	h.stickyMu.RLock()
-	sticky := h.sticky[h.stickyKey(rt.Kind)]
+	sticky := h.sticky[h.stickyKey(rt.Kind, model)]
 	h.stickyMu.RUnlock()
 
 	// 尝试粘性路由
@@ -269,27 +283,39 @@ func (h *Handler) pickWithSticky(rt *Runtime, model string) *auth.Auth {
 
 	// 新建粘性记录
 	h.stickyMu.Lock()
-	h.sticky[h.stickyKey(rt.Kind)] = &stickyEntry{uid: acct.UID, maxReqs: defaultMaxReqs}
+	h.sticky[h.stickyKey(rt.Kind, model)] = &stickyEntry{uid: acct.UID, maxReqs: defaultMaxReqs}
 	h.stickyMu.Unlock()
-	log.Printf("new sticky route platform=%s uid=%s maxReqs=%d", rt.Kind, acct.UID, defaultMaxReqs)
+	log.Printf("new sticky route platform=%s model=%s uid=%s maxReqs=%d", rt.Kind, model, acct.UID, defaultMaxReqs)
 	return acct
 }
 
-// stickySuccess 粘性路由成功：递增请求计数。
-func (h *Handler) stickySuccess(rt *Runtime) {
+// stickySuccess 粘性路由成功：递增请求计数（按渠道+模型粒度）。
+func (h *Handler) stickySuccess(rt *Runtime, model string) {
 	h.stickyMu.Lock()
 	defer h.stickyMu.Unlock()
-	key := h.stickyKey(rt.Kind)
+	key := h.stickyKey(rt.Kind, model)
 	if e := h.sticky[key]; e != nil {
 		e.reqCount++
 	}
 }
 
-// stickyClear 粘性路由失败（错误/冷却）：清除粘性记录，下次请求强制重新选号。
-func (h *Handler) stickyClear(rt *Runtime) {
+// stickyClear 粘性路由失败（错误/冷却）：清除该（渠道,模型）的粘性记录。
+//
+// model 为空串时清理**整个渠道下所有模型**的记录：GLM images 这类与模型无关的
+// 路径拿不到 model，失败时该渠道整体被视为有问题，逐条残留粘性只会继续选中坏号。
+func (h *Handler) stickyClear(rt *Runtime, model string) {
 	h.stickyMu.Lock()
 	defer h.stickyMu.Unlock()
-	delete(h.sticky, h.stickyKey(rt.Kind))
+	if model != "" {
+		delete(h.sticky, h.stickyKey(rt.Kind, model))
+		return
+	}
+	prefix := rt.Kind.String() + "/"
+	for k := range h.sticky {
+		if k == rt.Kind.String() || strings.HasPrefix(k, prefix) {
+			delete(h.sticky, k)
+		}
+	}
 }
 
 // StickyState 粘性路由快照片段（运行统计喂入用）。
@@ -302,6 +328,10 @@ type StickyState struct {
 // StickySnapshot 返回粘性路由快照（key = 渠道名，即 provider.Kind.String()）。
 // 供运行统计引擎喂 ApplySticky——进程内直读取代 sidecar 对粘性日志行的解析；
 // 无粘性记录的渠道不出现在结果里。
+//
+// 粘性记录自 2026-10-23 起按（渠道,模型）维度存，本快照仍**按渠道聚合**：
+// 同一渠道多个模型各持粘性记录时，取 reqCount 最大的一条作为该渠道的「当前使用中」
+// 账号（面板该列语义就是「这个渠道现在在跑哪个号」，不需要也没地方展示逐模型明细）。
 func (h *Handler) StickySnapshot() map[string]StickyState {
 	h.stickyMu.RLock()
 	defer h.stickyMu.RUnlock()
@@ -310,7 +340,15 @@ func (h *Handler) StickySnapshot() map[string]StickyState {
 		if e == nil || e.uid == "" {
 			continue
 		}
-		out[k] = StickyState{UID: e.uid, Count: e.reqCount, Max: e.maxReqs}
+		// key 形如 "workbuddy/glm-5.2" 或旧式渠道级 "workbuddy"——统一取渠道段
+		group := k
+		if i := strings.IndexByte(k, '/'); i > 0 {
+			group = k[:i]
+		}
+		if cur, ok := out[group]; ok && cur.Count >= e.reqCount {
+			continue // 已有更高计数的记录，保留它
+		}
+		out[group] = StickyState{UID: e.uid, Count: e.reqCount, Max: e.maxReqs}
 	}
 	return out
 }
@@ -779,7 +817,7 @@ func (h *Handler) serveRotation(
 		}
 		if tried[acct.UID] {
 			// 粘性路由选回已尝试的账号，清除粘性记录后重试
-			h.stickyClear(rt)
+			h.stickyClear(rt, model)
 			acct = rt.Pool.PickExcludingForModel(tried, model)
 			if acct == nil {
 				break
@@ -791,7 +829,7 @@ func (h *Handler) serveRotation(
 			if err := rt.Upstream.RefreshToken(acct); err != nil {
 				log.Printf("refresh failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)
 				lastErr = err
-				h.stickyClear(rt)
+				h.stickyClear(rt, model)
 				// 本机网络/DNS 挂着时（`dial tcp: lookup ...: no such host`、connection refused），
 				// 所有账号都刷不出来，换号必撞同一面墙 ⇒ 直接 502，别把 N×30s 超时堆满。
 				if isNetworkError(err) {
@@ -818,7 +856,7 @@ func (h *Handler) serveRotation(
 		rc, status, respBody, terr := rt.Upstream.ChatStream(acct, body)
 		if terr != nil {
 			lastErr = terr
-			h.stickyClear(rt)
+			h.stickyClear(rt, model)
 			// 传输层错误（连接超时 / 拒连 / 等响应头超时）：同一渠道所有账号打的是**同一个
 			// host**，网络层故障与账号无关 ⇒ 换号必然撞同一面墙，而且单次可长达 120s。
 			// 直接 502 把重试交给客户端（原逻辑：多号渠道轮 3 次 = 最长 6 分钟白等）。
@@ -832,7 +870,7 @@ func (h *Handler) serveRotation(
 		}
 		if status >= 400 {
 			statRow.Status = status // 所有透传出口（单账号/请求级/惩罚后）共用
-			h.stickyClear(rt)
+			h.stickyClear(rt, model)
 			kind := rt.Upstream.Classify(status, string(respBody))
 			// 单账号渠道：任何账号级惩罚都等于整条渠道下线，故一律原文透传、不罚账号。
 			// 尤其在 429（唯一需要的背压）上：冷却后后续请求会在挑号阶段被挡成
@@ -973,7 +1011,7 @@ func (h *Handler) serveRotation(
 		// 降级是否生效，故与请求内降级路径的 statRow.Status 清零同源处理。
 		statRow.Status = 0
 		rt.Pool.NoteSuccess(acct.UID)
-		h.stickySuccess(rt)
+		h.stickySuccess(rt, model)
 		if stream {
 			usage, serr := rt.Upstream.Stream(w, rc, dispModel)
 			// 排队提示（qodercn 10605 isQueued）：上游把「模型拥塞」当成 HTTP 200 里的
@@ -984,7 +1022,7 @@ func (h *Handler) serveRotation(
 			// 180.3/180.7/180.8s 三次，每轮扣掉 3 分钟，且零 token 计费）。
 			var qe *provider.Queued
 			if errors.As(serr, &qe) && !sw.written {
-				h.stickyClear(rt)
+				h.stickyClear(rt, model)
 				rt.Pool.CooldownModel(acct.UID, model, qe.Cooldown(), "model queued")
 				clearSSEHeaders(w) // StreamCapture 已写进 header 的 SSE 头必须撤掉
 				log.Printf("model queued platform=%s uid=%s model=%s %s（换下一个账号，冷却 %s）",
@@ -1003,7 +1041,7 @@ func (h *Handler) serveRotation(
 				var sec provider.StreamErrorClassifier
 				if errors.As(serr, &sec) && sec.Kind().Rotatable() {
 					kind := sec.Kind()
-					h.stickyClear(rt)
+					h.stickyClear(rt, model)
 					switch kind {
 					case provider.ErrHardCredit:
 						rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.hardCooldown(), "stream 402 权益不足")

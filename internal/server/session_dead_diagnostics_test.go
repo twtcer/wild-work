@@ -40,7 +40,7 @@ func TestStickyRouteSkipsSessionDead(t *testing.T) {
 
 	// 再验证「粘性记录指向 B」时也必须跳过：模拟上一次成功路由到 B、之后 B 失效。
 	h.stickyMu.Lock()
-	h.sticky[h.stickyKey(provider.GLM)] = &stickyEntry{uid: "sd-B", maxReqs: 50}
+	h.sticky[h.stickyKey(provider.GLM, "m")] = &stickyEntry{uid: "sd-B", maxReqs: 50}
 	h.stickyMu.Unlock()
 	acct = h.pickWithSticky(rt, "m")
 	if acct != nil && acct.UID == "sd-B" {
