@@ -1,7 +1,7 @@
 // Package logincb 描述「本机 OAuth 回调」的监听地址与对外可见主机。
 //
 // 背景（issue：Docker 形态下千问办公/TraeWork 浏览器登录回调失败）：
-// traework 与 qwenwork 的登录要把回调地址写进授权 URL（redirect_uri /
+// traework 的登录要把回调地址写进授权 URL（redirect_uri /
 // auth_callback_url），旧实现固定 `net.Listen("tcp", "127.0.0.1:0")` +
 // 回调 URL 恒用 `127.0.0.1:<随机端口>`。桌面形态没问题——浏览器与进程同机；
 // 但容器内这 3 个值分别是：

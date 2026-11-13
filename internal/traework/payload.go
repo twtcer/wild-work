@@ -90,14 +90,15 @@ func PrepareBody(src []byte, function string) []byte {
 	// 字样）；对容忍递归的后端，展开后的有限 schema 依旧合法。
 	breakToolSchemaCycles(obj)
 	normalizeTools(obj)
+	// 出站脱敏（与 workbuddyai 同款，见 wb_utils.go）：剥离上游内容审核黑名单指纹。
+	// 在 marshal **之前**对已解码的 obj 原地净化——此时 content 已是 block 数组，
+	// cleanContent 同时兼容 string 与 []any 两种形态；预检不命中零改动。
+	sanitize.MessagesInPlace(obj)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
 	}
-	// 末尾挂脱敏（与 workbuddyai 同款，见 wb_utils.go）：剥离上游内容审核黑名单指纹。
-	// 挂在改写之后——此时 content 已是 block 数组，cleanContent 同时兼容 string 与
-	// []any 两种形态；预检不命中原样返回（零分配）。
-	return sanitize.Messages(out)
+	return out
 }
 
 func normalizeToolChoice(obj map[string]any) {

@@ -40,7 +40,7 @@ func OpenURL(url string) error { return exec.Command("xdg-open", url).Start() }
 // 用户级与 macOS LaunchAgent 语义一致（登录用户会话启动）。
 //
 // 注意：用户在无 systemd 的环境（如容器、OpenRC）下 enable 会失败——如实返回错误，
-// 不假装成功（与 Windows/macOS 同口径）。容器内本来也不该自启（R125）。
+// 不假装成功（与 Windows/macOS 同口径）。容器内本来也不该自启（R157）。
 const autostartUnitName = "wild-work.service"
 
 // autostartUnitPath 用户级 unit 路径（XDG_CONFIG_HOME 优先，回退 ~/.config）。

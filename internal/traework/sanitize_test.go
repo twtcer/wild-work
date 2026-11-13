@@ -47,15 +47,16 @@ func TestPrepareBodyStripsFingerprint(t *testing.T) {
 		asserts func(t *testing.T, got string)
 	}{
 		{
-			// DSH 身份句：上游按 system 开头逐字锚定，插冠词 the 绕过（实测 200）
-			"DSH 身份句插冠词",
-			"You are an AI agent powered by DeepSeek Harness running",
+			// DSH 身份句 + 品牌串：上游按 system 开头逐字锚定，且品牌串原样即 400，
+			// 统一缩写为 DSH（R151/R156 生产口径）。
+			"DSH 身份句缩写",
+			"You are an AI agent powered by the DeepSeek Harness running",
 			func(t *testing.T, got string) {
-				if strings.Contains(got, "powered by DeepSeek Harness running") {
-					t.Fatalf("DSH 逐字串未被改写（脱敏未接线？）: %q", got)
+				if strings.Contains(strings.ToLower(got), "deepseek harness") {
+					t.Fatalf("DSH 品牌串未被改写（脱敏未接线？）: %q", got)
 				}
-				if !strings.Contains(got, "the DeepSeek Harness") {
-					t.Fatalf("DSH 句应插冠词 the 绕过逐字锚定: %q", got)
+				if !strings.Contains(got, "powered by DSH") {
+					t.Fatalf("DSH 身份句应缩写为 powered by DSH: %q", got)
 				}
 			},
 		},
@@ -86,15 +87,13 @@ func TestPrepareBodyStripsFingerprint(t *testing.T) {
 			},
 		},
 		{
-			// 裸 11128：插连字符破坏整单拦截，保留可读性
-			"裸 11128 插连字符",
-			"upstream rejected with code 11128 here",
+			// 裸 11-128 是错误码而非指纹：2026-11-02 探针实测不再被拦，规则已停用（R151）。
+			// 反向护栏——正文原文不得被改写（脱敏只改指纹，不改语义）。
+			"裸 11-128 不再改写",
+			"upstream rejected with code 11-128 here",
 			func(t *testing.T, got string) {
-				if strings.Contains(got, "11128") {
-					t.Fatalf("裸 11128 未被改写（整单拦截仍在）: %q", got)
-				}
 				if !strings.Contains(got, "11-128") {
-					t.Fatalf("11128 应改写为 11-128: %q", got)
+					t.Fatalf("已停用的 11-128 规则不得再改写正文: %q", got)
 				}
 			},
 		},

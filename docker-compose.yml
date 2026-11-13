@@ -24,7 +24,7 @@ services:
     ports:
       # 宿主机端口冲突时改左侧，如 "8080:7863"（容器内监听端口不变则健康检查无需动）
       - "7863:7863"
-      # OAuth 本机回调（traework / qwenwork 添加账号时用）。
+      # OAuth 本机回调（traework 添加账号时用）。
       # redirect_uri 仍写 http://127.0.0.1:43903/...，所以必须让宿主 127.0.0.1:43903
       # 转发进容器 —— 否则浏览器拿到 code 后 connection refused（登录超时）。
       # 只绑宿主环回：本机浏览器够用，且不把回调端口暴露给局域网。
@@ -66,7 +66,7 @@ services:
       # 思考链死循环检测（R50）：默认开启，写 false 关闭
       WILDWORK_LOOP_GUARD: "${WILDWORK_LOOP_GUARD:-}"
       # OAuth 回调写进 redirect_uri 的主机（监听固定 0.0.0.0:43903）：默认 127.0.0.1，
-      # 从别的机器打开面板登录 traework/qwenwork 时改成面板机器 IP
+      # 从别的机器打开面板登录 traework 时改成面板机器 IP
       WILDWORK_CALLBACK_HOST: "${WILDWORK_CALLBACK_HOST:-}"
       # 三接口兼容层（面板「模型路由」同源）：默认渠道 workbuddy / max_tokens 封顶 32000
       WILDWORK_DEFAULT_CHANNEL: "${WILDWORK_DEFAULT_CHANNEL:-}"

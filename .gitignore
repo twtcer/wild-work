@@ -7,6 +7,7 @@ cmd/wild-work/icon.ico
 data/
 auths/
 config.json
+sanitize.toml
 *.log
 
 # Docker 本地形态（compose 挂载点 ./wildwork-data 含账号凭据；.env 含管理密码）
