@@ -219,8 +219,8 @@ type Config struct {
 	// 格式：「cline→socks5://…」+ 被丢弃的渠道列表。
 	LegacyProxyNote string `json:"-"`
 
-	// Callback 本机 OAuth 回调监听（traework / qwenwork 两个渠道会起本地回调，
-	// 其余渠道均为上游轮询式、不经本地端口）。默认值即桌面旧行为；容器内需
+	// Callback 本机 OAuth 回调监听（目前只有 traework 会起本地回调，
+	// 其余渠道均为上游轮询式/设备流、不经本地端口）。默认值即桌面旧行为；容器内需
 	// 固定端口并对宿主发布，否则浏览器拿 code 后 connection refused（登录超时）。
 	// 详见 internal/logincb 包注释。
 	Callback struct {
